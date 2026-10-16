@@ -36,7 +36,7 @@
 //! blocking on one).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use autome_domain::environment::{Component, ComponentStatus, Environment, Login};
@@ -115,12 +115,16 @@ const CODEX_LOGIN_PROBES: &[LoginProbe] = &[
     },
 ];
 
+// Installed CLI help exposes no authentication status command.
+const AGY_LOGIN_PROBES: &[LoginProbe] = &[];
+
 /// The table for a component, empty for the two that have no login (§11:
 /// Git and iTerm2 are "不适用").
 pub fn login_probes(component: Component) -> &'static [LoginProbe] {
     match component {
         Component::Claude => CLAUDE_LOGIN_PROBES,
         Component::Codex => CODEX_LOGIN_PROBES,
+        Component::Agy => AGY_LOGIN_PROBES,
         _ => &[],
     }
 }
@@ -201,9 +205,17 @@ pub fn has_prerequisite(name: &str) -> bool {
 /// told what PATH is, where the iTerm2 bundle would be, and what time it
 /// is. Tests drive this, so the suite never depends on which of the four
 /// tools the machine running it happens to have.
+fn active_components() -> [Component; 5] {
+    if cfg!(windows) {
+        Component::for_windows()
+    } else {
+        Component::for_macos()
+    }
+}
+
 fn probe_all_with(path_var: &str, iterm_app: &Path, now: &str) -> Environment {
     Environment {
-        components: Component::ALL
+        components: active_components()
             .into_iter()
             .map(|c| probe_with(c, path_var, iterm_app, now))
             .collect(),
@@ -223,7 +235,25 @@ fn probe_with(
         Component::Git => probe_binary(Component::Git, "git", path_var, now),
         Component::Claude => probe_binary(Component::Claude, "claude", path_var, now),
         Component::Codex => probe_binary(Component::Codex, "codex", path_var, now),
+        Component::Agy => probe_binary(Component::Agy, "agy", path_var, now),
         Component::ITerm2 => probe_iterm2(iterm_app, now),
+        Component::GitBash => match crate::platform::git_bash() {
+            Ok(path) => {
+                let version = match run_capture(&path, &["--version"], PROBE_TIMEOUT) {
+                    RunOutcome::Completed(c) => extract_version(&c.stdout, &c.stderr),
+                    _ => None,
+                };
+                ComponentStatus {
+                    component,
+                    present: true,
+                    version,
+                    path: Some(path.to_string_lossy().into_owned()),
+                    login: Login::NotApplicable,
+                    checked_at: now.into(),
+                }
+            }
+            Err(_) => ComponentStatus::missing(component, now),
+        },
     }
 }
 
@@ -281,6 +311,9 @@ fn probe_iterm2(app_dir: &Path, now: &str) -> ComponentStatus {
 /// the deadline are skipped, and if the table runs out the result is
 /// `Unknown` naming every form tried — that string is the bug report.
 fn probe_login(component: Component, binary_path: &Path) -> Login {
+    if component == Component::Agy {
+        return probe_agy_login(binary_path);
+    }
     let probes = login_probes(component);
     if probes.is_empty() {
         return Login::NotApplicable;
@@ -331,7 +364,60 @@ fn probe_login(component: Component, binary_path: &Path) -> Login {
     }
 }
 
-/// The environment variable, if any, that configures `component` with an API
+fn probe_agy_login(binary_path: &Path) -> Login {
+    match run_capture(binary_path, &["models"], PROBE_TIMEOUT) {
+        RunOutcome::Completed(capture) => {
+            if capture.exit_code == Some(0) {
+                let stdout = capture.stdout.trim();
+                let stderr = capture.stderr.trim();
+                let combined = format!("{stdout}\n{stderr}").to_lowercase();
+                if contains_any(&combined, LOGGED_OUT_MARKERS) {
+                    return Login::Expired;
+                }
+                let has_models = stdout.lines().any(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty()
+                        && !trimmed.starts_with("Fetching")
+                        && !trimmed.starts_with("Available")
+                        && (trimmed.contains("gemini")
+                            || trimmed.contains("claude")
+                            || trimmed.contains("gpt")
+                            || trimmed.contains('\t'))
+                });
+                if has_models || !stdout.is_empty() {
+                    Login::Ok { account_hint: None }
+                } else {
+                    Login::Unknown {
+                        detail: "agy models 返回成功但输出为空".into(),
+                    }
+                }
+            } else {
+                let err_msg = if !capture.stderr.trim().is_empty() {
+                    capture.stderr.trim()
+                } else if !capture.stdout.trim().is_empty() {
+                    capture.stdout.trim()
+                } else {
+                    "进程非零退出"
+                };
+                let lower = err_msg.to_lowercase();
+                if contains_any(&lower, LOGGED_OUT_MARKERS) {
+                    Login::Expired
+                } else {
+                    Login::Unknown {
+                        detail: format!("agy 连通测试失败（退出码 {:?}）：{err_msg}", capture.exit_code),
+                    }
+                }
+            }
+        }
+        RunOutcome::TimedOut => Login::Unknown {
+            detail: "agy models 探测超时，请检查网络或 CLI 响应".into(),
+        },
+        RunOutcome::Failed(err) => Login::Unknown {
+            detail: format!("执行 agy 测试失败：{err}"),
+        },
+    }
+}
+
 /// key instead of a login. `lookup` is a parameter so this is testable
 /// without touching the process environment — a process-global read is how
 /// three earlier defects in this codebase started.
@@ -342,6 +428,7 @@ fn api_key_env_var(
     let names: &[&str] = match component {
         Component::Claude => &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
         Component::Codex => &["OPENAI_API_KEY"],
+        Component::Agy => &[],
         _ => &[],
     };
     names
@@ -373,11 +460,7 @@ where
     if binary.is_empty() {
         return None;
     }
-    path_var
-        .split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join(binary))
-        .find(|candidate| is_executable(candidate))
+    crate::platform::find_on_path(path_var, binary, is_executable)
 }
 
 /// Real-file-system predicate for `find_on_path`: a regular file (after
@@ -423,6 +506,8 @@ fn extract_version(stdout: &str, stderr: &str) -> Option<String> {
 fn version_in(text: &str) -> Option<String> {
     text.split_whitespace().find_map(|token| {
         let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+        // GNU Bash appends its patch/build level: 5.2.37(1)-release.
+        let token = token.split('(').next().unwrap_or(token);
         let token = match token.strip_prefix('v') {
             Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
             _ => token,
@@ -657,8 +742,12 @@ enum RunOutcome {
 /// closes the pipes, so they finish on their own, and we do not join them
 /// — the point of the deadline is not to block here.
 fn run_capture(program: &Path, args: &[&str], timeout: Duration) -> RunOutcome {
-    let mut child = match Command::new(program)
-        .args(args)
+    let mut cmd = match crate::platform::command(program) {
+        Ok(cmd) => cmd,
+        Err(e) => return RunOutcome::Failed(e.to_string()),
+    };
+    cmd.args(args);
+    let mut child = match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -801,6 +890,14 @@ mod tests {
     }
 
     #[test]
+    fn git_bash_version_line_yields_the_number() {
+        assert_eq!(
+            extract_version("GNU bash, version 5.2.37(1)-release (x86_64-pc-msys)\n", ""),
+            Some("5.2.37".into())
+        );
+    }
+
+    #[test]
     fn apple_git_suffix_does_not_confuse_the_scan() {
         assert_eq!(
             extract_version("git version 2.39.5 (Apple Git-154)\n", ""),
@@ -846,31 +943,53 @@ mod tests {
 
     #[test]
     fn path_scan_returns_the_first_match_in_path_order() {
-        let found = find_on_path("/a:/b:/c", "claude", |p| {
-            p == Path::new("/b/claude") || p == Path::new("/c/claude")
-        });
+        let found = find_on_path(
+            &std::env::join_paths(["/a", "/b", "/c"])
+                .unwrap()
+                .to_string_lossy(),
+            "claude",
+            |p| p == Path::new("/b/claude") || p == Path::new("/c/claude"),
+        );
         assert_eq!(found, Some(PathBuf::from("/b/claude")));
     }
 
     #[test]
     fn path_scan_skips_entries_that_are_not_executable() {
         // /a/git exists but is not executable, /b/git is.
-        let found = find_on_path("/a:/b", "git", |p| p == Path::new("/b/git"));
+        let found = find_on_path(
+            &std::env::join_paths(["/a", "/b"])
+                .unwrap()
+                .to_string_lossy(),
+            "git",
+            |p| p == Path::new("/b/git"),
+        );
         assert_eq!(found, Some(PathBuf::from("/b/git")));
     }
 
     #[test]
     fn path_scan_skips_empty_segments_and_can_find_nothing() {
         let seen = std::cell::RefCell::new(Vec::new());
-        let found = find_on_path("::/a:", "codex", |p| {
-            seen.borrow_mut().push(p.to_path_buf());
-            false
-        });
+        let found = find_on_path(
+            &std::env::join_paths(["", "", "/a", ""])
+                .unwrap()
+                .to_string_lossy(),
+            "codex",
+            |p| {
+                seen.borrow_mut().push(p.to_path_buf());
+                false
+            },
+        );
         assert_eq!(found, None);
-        assert_eq!(seen.into_inner(), vec![PathBuf::from("/a/codex")]);
+        assert!(!seen.borrow().is_empty());
+        assert!(
+            seen.borrow()
+                .iter()
+                .all(|p| p.parent() == Some(Path::new("/a")))
+        );
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_scan_on_a_real_directory_honours_the_execute_bit() {
         let empty = Scratch::new("path-empty");
         let real = Scratch::new("path-real");
@@ -1149,8 +1268,12 @@ mod tests {
 
     #[test]
     fn a_completed_command_captures_both_streams_and_its_exit_code() {
+        #[cfg(windows)]
+        let sh = crate::launcher::git_bash_path().expect("Git Bash");
+        #[cfg(not(windows))]
+        let sh = PathBuf::from("/bin/sh");
         let outcome = run_capture(
-            Path::new("/bin/sh"),
+            &sh,
             &["-c", "echo out; echo err 1>&2; exit 7"],
             Duration::from_secs(5),
         );
@@ -1167,11 +1290,11 @@ mod tests {
     #[test]
     fn a_hung_command_is_killed_at_the_deadline() {
         let started = Instant::now();
-        let outcome = run_capture(
-            Path::new("/bin/sh"),
-            &["-c", "sleep 30"],
-            Duration::from_millis(200),
-        );
+        #[cfg(windows)]
+        let sh = crate::launcher::git_bash_path().expect("Git Bash");
+        #[cfg(not(windows))]
+        let sh = PathBuf::from("/bin/sh");
+        let outcome = run_capture(&sh, &["-c", "sleep 30"], Duration::from_millis(200));
         assert_eq!(outcome, RunOutcome::TimedOut);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1367,11 +1490,13 @@ mod tests {
         );
 
         let seen: Vec<Component> = env.components.iter().map(|c| c.component).collect();
-        assert_eq!(seen, Component::ALL.to_vec());
+        assert_eq!(seen, active_components().to_vec());
         assert_eq!(env.checked_at, "2026-09-15T00:00:00Z");
         for status in &env.components {
             assert_eq!(status.checked_at, env.checked_at);
-            assert!(!status.present);
+            if status.component != Component::GitBash {
+                assert!(!status.present);
+            }
         }
         assert!(!env.can_run_anything(), "no git means nothing can run");
     }

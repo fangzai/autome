@@ -44,6 +44,7 @@ pub struct Ctx {
     pub home: std::path::PathBuf,
     /// The environment as last observed, updated by a background thread.
     pub environment: EnvCache,
+    pub models: crate::models::Catalog,
     /// Where sessions are started. Production runs them headless — a Loop
     /// opens six or more sessions and a window each would interrupt the user
     /// every time. The test suites set this rather than a process-global
@@ -69,6 +70,7 @@ impl Ctx {
             autome_home: autome_home.into(),
             home: home.into(),
             environment: EnvCache::default(),
+            models: crate::models::Catalog::default(),
             launch_mode: crate::launcher::LaunchMode::Headless,
             recovered: false,
         }
@@ -413,6 +415,13 @@ fn dispatch(ctx: &mut Ctx, command: &Command) -> DispatchResult {
         // ---- skills ------------------------------------------------------
         "skills.list" => skills_list(ctx, opt_str_param(p, "project_id")),
 
+        // ---- runtime -----------------------------------------------------
+        "runtime.models" => runtime_models(
+            ctx,
+            str_param(p, "runtime")?,
+            p.get("refresh").and_then(Value::as_bool).unwrap_or(false),
+        ),
+
         // ---- stream ------------------------------------------------------
         "events.since" => events_since(ctx, p),
 
@@ -564,7 +573,13 @@ fn project_add(
     let canonical = path
         .canonicalize()
         .map_err(|e| internal(format!("无法解析路径：{e}")))?;
-    let canonical_str = canonical.to_string_lossy().into_owned();
+    let mut canonical_str = canonical.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = canonical_str.strip_prefix(r"\\?\") {
+            canonical_str = stripped.to_string();
+        }
+    }
 
     // A directory that was removed from the registry can be added again: P-08
     // says removal touches nothing on disk, so there is nothing to stop the
@@ -584,12 +599,13 @@ fn project_add(
     };
 
     // Nested projects would make `.worktree/` and `.autome/` ambiguous.
+    let canonical_path = std::path::Path::new(&canonical_str);
     for other in ctx.store.list_projects()? {
         let other_path = std::path::Path::new(&other.path);
-        if canonical.starts_with(other_path) || other_path.starts_with(&canonical) {
+        if canonical_path.starts_with(other_path) || other_path.starts_with(canonical_path) {
             return Err(rejected(format!(
                 "{} 与已有项目「{}」嵌套，不能同时管理",
-                canonical.display(),
+                canonical_path.display(),
                 other.display_name
             )));
         }
@@ -914,6 +930,7 @@ fn init_commit(project: &Project) -> std::result::Result<Option<String>, Dispatc
     let mut paths: Vec<String> = vec![
         ".autome".into(),
         ".gitignore".into(),
+        ".gitattributes".into(),
         "AGENTS.md".into(),
         "docs".into(),
     ];
@@ -1751,8 +1768,16 @@ fn task_stop(ctx: &mut Ctx, task_id: &str) -> DispatchResult {
 /// Kills whatever session this task has running and records it as killed.
 fn stop_running_session(ctx: &mut Ctx, task_id: &str) -> Result<(), DispatchError> {
     if let Some(session) = ctx.store.running_session(task_id)? {
-        if let Some(pid) = session.pid {
-            let _ = crate::launcher::stop_session(pid);
+        let log = std::path::Path::new(&session.log_path);
+        let finished = std::fs::read_to_string(log.with_extension("exit"))
+            .ok()
+            .and_then(|text| autome_domain::session::ExitMarker::parse(&text))
+            .is_some();
+        if !finished && ctx.launch_mode != crate::launcher::LaunchMode::Dry {
+            let pid = session
+                .pid
+                .ok_or_else(|| internal("会话尚无可验证的 PID，保留工作目录，请重试"))?;
+            crate::launcher::stop_owned_session(pid, log).map_err(|e| internal(e.to_string()))?;
         }
         ctx.store.finish_session(
             &session.id,
@@ -2161,6 +2186,7 @@ fn env_json(cache: &EnvCache) -> Value {
         "prerequisites": {
             "brew": env_probe::has_prerequisite("brew"),
             "npm": env_probe::has_prerequisite("npm"),
+            "winget": env_probe::has_prerequisite("winget"),
         },
     })
 }
@@ -2168,7 +2194,11 @@ fn env_json(cache: &EnvCache) -> Value {
 fn env_install_recipe(params: &Value) -> DispatchResult {
     let raw = str_param(params, "component")?;
     let component = Component::parse(raw).ok_or_else(|| bad_params(format!("未知组件 `{raw}`")))?;
-    let recipe = environment::install_recipe(component);
+    let mut recipe = environment::install_recipe(component);
+    if cfg!(windows) && component == Component::Git {
+        recipe = environment::install_recipe(Component::GitBash);
+        recipe.component = component;
+    }
     let prerequisite_ok = recipe
         .prerequisite
         .as_deref()
@@ -2293,10 +2323,21 @@ pub fn protocol_error_reply(message: String) -> Reply {
     }
 }
 
+fn runtime_models(ctx: &Ctx, raw_runtime: &str, refresh: bool) -> DispatchResult {
+    let runtime = Runtime::parse(raw_runtime)
+        .ok_or_else(|| bad_params(format!("未知 runtime `{raw_runtime}`")))?;
+    let binary = crate::launcher::resolve_binary(runtime).map(std::path::PathBuf::from);
+    let snapshot = ctx.models.request(runtime, binary, refresh);
+    Ok((
+        serde_json::to_value(snapshot).map_err(|e| internal(e.to_string()))?,
+        vec![],
+    ))
+}
+
 /// Method names the read channel may carry: everything that cannot mutate.
 /// Electron Main enforces the split, but the list lives here so it stays next
 /// to the dispatch table it describes.
-pub const READ_METHODS: [&str; 19] = [
+pub const READ_METHODS: [&str; 20] = [
     "project.list",
     "project.probe",
     "project.get",
@@ -2316,6 +2357,7 @@ pub const READ_METHODS: [&str; 19] = [
     "protocol.versions",
     "protocol.eval",
     "protocol.triggers",
+    "runtime.models",
 ];
 
 #[cfg(test)]
@@ -2477,6 +2519,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_models_returns_models_for_known_runtimes() {
+        let mut sb = Sandbox::new("runtime-models");
+        sb.ctx().models = crate::models::Catalog::testing();
+        let out = handle_command(
+            sb.ctx(),
+            &cmd("runtime.models", json!({"runtime": "codex"})),
+        );
+        let payload = ok_payload(&out);
+        assert!(payload["models"].is_array());
+
+        let out_agy = handle_command(sb.ctx(), &cmd("runtime.models", json!({"runtime": "agy"})));
+        let payload_agy = ok_payload(&out_agy);
+        assert!(payload_agy["models"].is_array());
     }
 
     // ---- projects --------------------------------------------------------
@@ -2837,6 +2895,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_scaffold_never_writes_through_a_symlinked_agents_file() {
         // A workspace root's AGENTS.md is routinely a link into one of the
         // member repositories. Following it means editing a tracked file in a
@@ -3430,7 +3489,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            4
+            5
         );
         assert!(payload["generation"].as_u64().unwrap() >= 1);
     }

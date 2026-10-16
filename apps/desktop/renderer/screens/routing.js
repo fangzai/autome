@@ -27,6 +27,8 @@ const EFFORT_OPTIONS = [
   ['low', 'low'],
   ['medium', 'medium'],
   ['high', 'high'],
+  ['xhigh', 'xhigh'],
+  ['max', 'max'],
 ];
 
 /** `[from, to, options]`, lifted from the design document's edge table. */
@@ -489,6 +491,8 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
     onChange: (event) => {
       config.runtime = event.target.value;
       refreshImpact();
+      updateEffort();
+      loadModels();
     },
   });
   for (const [value, label] of Object.entries(labels.RUNTIME_LABELS)) {
@@ -499,19 +503,87 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
   form.appendChild(h('label', { text: 'CLI' }));
   form.appendChild(runtimeSelect);
 
-  // 模型 — free text, because the core does not publish a model catalogue and
-  // inventing one here would go stale the week a CLI ships a new name.
-  const modelInput = h('input', {
-    type: 'text',
-    value: config.model || '',
-    placeholder: 'claude-opus-5',
-    onInput: (event) => {
-      config.model = event.target.value.trim();
+  // 模型 — 下拉选择框
+  const modelSelect = h('select.select', {
+    onChange: (event) => {
+      config.model = event.target.value;
+      updateEffort();
       refreshImpact();
     },
   });
   form.appendChild(h('label', { text: '模型' }));
-  form.appendChild(h('label.input', [modelInput]));
+  form.appendChild(modelSelect);
+
+  const modelStatus = h('span.small.muted', { role: 'status' });
+  const modelRefresh = h('button.btn.btn--sm', {
+    type: 'button',
+    text: '刷新模型',
+    onClick: () => loadModels(true),
+  });
+  form.appendChild(h('div.row', [modelStatus, modelRefresh]));
+
+  let modelQuery = 0;
+  async function loadModels(refresh = false) {
+    const request = ++modelQuery;
+    const runtime = config.runtime;
+    modelStatus.textContent = '正在查询模型…';
+    modelSelect.disabled = true;
+    modelRefresh.disabled = true;
+    try {
+      for (let poll = 0; poll < 60; poll += 1) {
+        const state = await read('runtimeModels', runtime, refresh && poll === 0);
+        if (request !== modelQuery || !form.isConnected) return;
+        if (state.status === 'loading') {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        modelSelect.replaceChildren();
+        const models = state.models || [];
+        if (models.length > 0) {
+          let foundSelected = false;
+          for (const model of models) {
+            const label = model.name && model.name !== model.id ? `${model.name} (${model.id})` : model.id;
+            const option = h('option', { value: model.id, text: label });
+            if (config.model === model.id) {
+              option.selected = true;
+              foundSelected = true;
+            }
+            modelSelect.appendChild(option);
+          }
+          if (!foundSelected) {
+            if (config.model) {
+              const currentOpt = h('option', { value: config.model, text: `${config.model} (当前值)` });
+              currentOpt.selected = true;
+              modelSelect.prepend(currentOpt);
+            } else {
+              config.model = models[0].id;
+              modelSelect.value = config.model;
+            }
+          }
+          modelStatus.textContent = `${models.length} 个候选模型`;
+        } else {
+          const fallback = config.model || '';
+          modelSelect.appendChild(h('option', { value: fallback, text: fallback || '暂无候选模型' }));
+          modelStatus.textContent = state.detail || '暂无模型列表';
+        }
+        updateEffort();
+        refreshImpact();
+        return;
+      }
+      modelStatus.textContent = '模型查询超时，可点击刷新重试';
+    } catch (error) {
+      if (request === modelQuery) {
+        modelStatus.textContent = `模型查询失败：${error.message}`;
+      }
+    } finally {
+      if (request === modelQuery) {
+        modelSelect.disabled = false;
+        modelRefresh.disabled = false;
+      }
+    }
+  }
+  // The drawer is attached synchronously by the end of this function.
+  setTimeout(() => { if (form.isConnected) loadModels(); }, 0);
 
   // Effort — empty means "use the CLI default", which is a real value.
   const effortSelect = h('select.select', {
@@ -526,6 +598,16 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
   }
   form.appendChild(h('label', { text: 'Effort' }));
   form.appendChild(effortSelect);
+  const effortStatus = h('span.small.muted');
+  form.appendChild(effortStatus);
+  function updateEffort() {
+    const embedded = config.runtime === 'agy' && /-(low|medium|high|xhigh|max)$/i.test(config.model || '');
+    effortSelect.disabled = embedded;
+    effortStatus.textContent = embedded
+      ? 'Effort 已由模型 ID 决定，此处设置不传给 CLI'
+      : (config.runtime === 'codex' ? 'Codex 思考深度，通过 --config 传给 CLI' : '');
+  }
+  updateEffort();
 
   // 绑定的技能 — S-03: bound means the role must use it.
   const skillRow = h('div.row');
@@ -638,20 +720,38 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
 // Validation and saving
 // ---------------------------------------------------------------------------
 
+export function modelIdentity(roleConfig) {
+  if (!roleConfig) return '';
+  const runtime = roleConfig.runtime || '';
+  const model = (roleConfig.model || '').trim();
+  if (!model) return `${runtime}:`;
+  let base = model;
+  for (const suffix of ['-high', '-medium', '-low', '-xhigh', '-max']) {
+    if (base.toLowerCase().endsWith(suffix)) {
+      base = base.slice(0, base.length - suffix.length);
+      break;
+    }
+  }
+  if (runtime === 'agy' && base.toLowerCase().startsWith('claude-')) {
+    return `claude:${base.slice(7)}`;
+  }
+  return `${runtime}:${base}`;
+}
+
 /** The same rule as `config::validate`: evaluator identity != generator's. */
 export function sameModelViolations(draft) {
-  const pairs = [['review', 'plan'], ['audit', 'impl']];
+  const pairs = [['review', 'plan'], ['audit', 'impl'], ['retro', 'impl']];
   const out = [];
   for (const [evaluator, generator] of pairs) {
     const e = draft[evaluator];
     const g = draft[generator];
     if (!e || !g || !e.enabled || !g.enabled) continue;
-    if (`${e.runtime}:${e.model}` === `${g.runtime}:${g.model}`) {
+    if (modelIdentity(e) === modelIdentity(g)) {
       out.push({
         kind: 'same_model',
         evaluator,
         generator,
-        identity: `${labels.runtimeLabel(e.runtime)} · ${e.model}`,
+        identity: `${labels.runtimeLabel(e.runtime)} · ${e.model || '默认'}`,
       });
     }
   }

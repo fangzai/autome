@@ -97,6 +97,8 @@ fn install_fake_cli() -> PathBuf {
         unsafe {
             std::env::set_var("AUTOMED_CLAUDE_BINARY", &script);
             std::env::set_var("AUTOMED_CODEX_BINARY", &script);
+            // current_exe here is the libtest runner, not the stream renderer.
+            std::env::set_var("AUTOMED_RENDERER_BINARY", env!("CARGO_BIN_EXE_automed"));
         }
         script
     })
@@ -1107,8 +1109,8 @@ fn the_wrapper_writes_a_terminated_exit_marker_carrying_the_clis_code() {
     std::fs::write(&prompt, "hello").unwrap();
 
     let wrapper = w.repo.join(".autome/skill/run_session.sh");
-    let status = std::process::Command::new("sh")
-        .arg(&wrapper)
+    let status = automed::platform::command(&wrapper)
+        .expect("wrapper command")
         .arg("s1")
         .arg(&dir)
         .arg("claude")
@@ -1147,8 +1149,8 @@ fn the_wrapper_refuses_a_missing_prompt_file_and_still_writes_a_marker() {
     let dir = w.repo.join(".autome/output/sessions/T-y");
     std::fs::create_dir_all(&dir).unwrap();
     let wrapper = w.repo.join(".autome/skill/run_session.sh");
-    let out = std::process::Command::new("sh")
-        .arg(&wrapper)
+    let out = automed::platform::command(&wrapper)
+        .expect("wrapper command")
         .arg("s2")
         .arg(&dir)
         .arg("claude")
@@ -1247,7 +1249,7 @@ fn every_session_records_what_it_cost_and_the_finished_task_is_measured() {
             autome_domain::role::Runtime::Claude => {
                 assert!(s.metrics.cost_usd.is_some(), "{} has no cost", s.id)
             }
-            autome_domain::role::Runtime::Codex => {
+            autome_domain::role::Runtime::Codex | autome_domain::role::Runtime::Agy => {
                 assert_eq!(s.metrics.cost_usd, None, "{} invented a price", s.id)
             }
         }

@@ -81,9 +81,24 @@ pub struct RoleConfig {
 }
 
 impl RoleConfig {
-    /// The identity SAME-MODEL compares (design §9: "比较 `runtime:model` 字面值").
+    /// The identity SAME-MODEL compares (P2 §2.5: compares normalized model family).
     pub fn model_identity(&self) -> String {
-        format!("{}:{}", self.runtime, self.model)
+        let trimmed = self.model.trim();
+        if trimmed.is_empty() {
+            return format!("{}:", self.runtime);
+        }
+        let mut base = trimmed;
+        for suffix in ["-high", "-medium", "-low", "-xhigh", "-max"] {
+            if let Some(stripped) = base.strip_suffix(suffix) {
+                base = stripped;
+                break;
+            }
+        }
+        if self.runtime == Runtime::Agy && base.starts_with("claude-") {
+            format!("claude:{}", base.trim_start_matches("claude-"))
+        } else {
+            format!("{}:{}", self.runtime, base)
+        }
     }
 }
 
@@ -182,19 +197,16 @@ impl Theme {
 }
 
 impl Default for GlobalConfig {
-    /// The first-run defaults: Claude generates, Codex evaluates.
+    /// Technical design §5:
+    /// - Plan: Claude Code
+    /// - Review: Codex
+    /// - Adjudicate: Claude Code
+    /// - Impl: Claude Code
+    /// - Audit: Codex
+    /// - Retro: Codex
     ///
-    /// Every model is left empty, meaning "whatever that CLI defaults to".
-    /// Naming specific models here would be guessing: the set a given account
-    /// can actually use is not knowable from this side, model names change
-    /// faster than releases, and a default that names an unavailable model
-    /// fails at the first session with an error about billing rather than
-    /// about configuration. The user picks models in the routing graph, where
-    /// the list is theirs.
-    ///
-    /// SAME-MODEL still holds on a fresh install, because the three evaluating
-    /// roles sit on the other runtime: `codex:` and `claude:` differ even when
-    /// both models are unset.
+    /// Every role starts on its CLI's default model (`""`), because naming one
+    /// would require knowing what the user's account has access to.
     fn default() -> Self {
         let role = |runtime: Runtime, effort: Option<&str>| RoleConfig {
             enabled: true,
@@ -209,8 +221,6 @@ impl Default for GlobalConfig {
         roles.insert(Role::Adjudicate, role(Runtime::Claude, None));
         roles.insert(Role::Impl, role(Runtime::Claude, Some("high")));
         roles.insert(Role::Audit, role(Runtime::Codex, Some("high")));
-        // The retro round evaluates what the implementation rounds produced,
-        // so it sits on the other runtime for the same reason the audit does.
         roles.insert(Role::Retro, role(Runtime::Codex, Some("high")));
         Self {
             loop_defaults: LoopDefaults::default(),
@@ -554,6 +564,7 @@ mod tests {
         g.roles.get_mut(&Role::Adjudicate).unwrap().model = "opus".into();
         g.roles.get_mut(&Role::Impl).unwrap().model = "opus".into();
         g.roles.get_mut(&Role::Audit).unwrap().model = "gpt-5.6-sol".into();
+        g.roles.get_mut(&Role::Retro).unwrap().model = "gpt-5.6-sol".into();
         g
     }
 
@@ -734,6 +745,58 @@ mod tests {
     }
 
     #[test]
+    fn same_model_family_with_different_effort_is_rejected() {
+        let mut g = GlobalConfig::default();
+        g.roles.get_mut(&Role::Plan).unwrap().runtime = Runtime::Agy;
+        g.roles.get_mut(&Role::Plan).unwrap().model = "gemini-4-argon-low".into();
+        g.roles.get_mut(&Role::Review).unwrap().runtime = Runtime::Agy;
+        g.roles.get_mut(&Role::Review).unwrap().model = "gemini-4-argon-high".into();
+
+        let resolved = resolve(&g, &ProjectConfig::default());
+        let violations = validate(&resolved, &NoSkills);
+        assert_eq!(
+            violations,
+            vec![ConfigViolation::SameModel {
+                evaluator: Role::Review,
+                generator: Role::Plan,
+                identity: "agy:gemini-4-argon".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cross_runtime_same_model_is_rejected() {
+        let mut g = GlobalConfig::default();
+        g.roles.get_mut(&Role::Plan).unwrap().runtime = Runtime::Claude;
+        g.roles.get_mut(&Role::Plan).unwrap().model = "opus".into();
+        g.roles.get_mut(&Role::Review).unwrap().runtime = Runtime::Agy;
+        g.roles.get_mut(&Role::Review).unwrap().model = "claude-opus-low".into();
+
+        let resolved = resolve(&g, &ProjectConfig::default());
+        let violations = validate(&resolved, &NoSkills);
+        assert_eq!(
+            violations,
+            vec![ConfigViolation::SameModel {
+                evaluator: Role::Review,
+                generator: Role::Plan,
+                identity: "claude:opus".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn different_models_on_agy_are_allowed() {
+        let mut g = GlobalConfig::default();
+        g.roles.get_mut(&Role::Plan).unwrap().runtime = Runtime::Agy;
+        g.roles.get_mut(&Role::Plan).unwrap().model = "gemini-4-argon-high".into();
+        g.roles.get_mut(&Role::Review).unwrap().runtime = Runtime::Agy;
+        g.roles.get_mut(&Role::Review).unwrap().model = "claude-opus-5-5-high".into();
+
+        let resolved = resolve(&g, &ProjectConfig::default());
+        assert!(validate(&resolved, &NoSkills).is_empty());
+    }
+
+    #[test]
     fn adjudicate_may_share_a_model_with_anything() {
         // adjudicate == plan == impl, all Claude opus-5 by default; only the
         // two evaluator pairs are constrained.
@@ -784,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_visible_to_both_runtimes_is_accepted_anywhere() {
+    fn a_skill_visible_to_all_runtimes_is_accepted_anywhere() {
         let mut project = ProjectConfig::default();
         for role in Role::ALL {
             project.roles.insert(
@@ -796,7 +859,10 @@ mod tests {
             );
         }
         let resolved = resolve(&GlobalConfig::default(), &project);
-        let skills = MapSkills::new(&[("conventions", &[Runtime::Claude, Runtime::Codex])]);
+        let skills = MapSkills::new(&[(
+            "conventions",
+            &[Runtime::Claude, Runtime::Codex, Runtime::Agy],
+        )]);
         assert!(validate(&resolved, &skills).is_empty());
     }
 
@@ -910,9 +976,6 @@ mod tests {
 
     #[test]
     fn an_empty_model_means_the_cli_default_and_is_not_a_violation_on_its_own() {
-        // Naming no model is the shipped default, and it is legitimate: each
-        // CLI has one, and the set a given account may use is not knowable
-        // from here.
         let resolved = resolve(&GlobalConfig::default(), &ProjectConfig::default());
         assert!(resolved.role(Role::Plan).config.model.is_empty());
         assert!(validate(&resolved, &NoSkills).is_empty());
@@ -922,15 +985,19 @@ mod tests {
     fn two_default_models_on_the_same_runtime_are_reported_distinctly() {
         // review on Claude with no model named is the same session as plan.
         // The user needs to be told to *name* one, not to change one.
+        let mut g = GlobalConfig::default();
+        g.roles.get_mut(&Role::Plan).unwrap().runtime = Runtime::Claude;
+        g.roles.get_mut(&Role::Plan).unwrap().model = String::new();
         let mut project = ProjectConfig::default();
         project.roles.insert(
             Role::Review,
             RoleOverrides {
                 runtime: Some(Runtime::Claude),
+                model: Some(String::new()),
                 ..Default::default()
             },
         );
-        let resolved = resolve(&GlobalConfig::default(), &project);
+        let resolved = resolve(&g, &project);
         assert_eq!(
             validate(&resolved, &NoSkills),
             vec![ConfigViolation::BothDefaultModels {
@@ -942,6 +1009,9 @@ mod tests {
 
     #[test]
     fn naming_a_model_on_one_side_resolves_the_default_collision() {
+        let mut g = GlobalConfig::default();
+        g.roles.get_mut(&Role::Plan).unwrap().runtime = Runtime::Claude;
+        g.roles.get_mut(&Role::Plan).unwrap().model = String::new();
         let mut project = ProjectConfig::default();
         project.roles.insert(
             Role::Review,
@@ -951,7 +1021,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let resolved = resolve(&GlobalConfig::default(), &project);
+        let resolved = resolve(&g, &project);
         assert!(validate(&resolved, &NoSkills).is_empty());
     }
 

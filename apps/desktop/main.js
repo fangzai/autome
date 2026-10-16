@@ -67,7 +67,7 @@ function createMainWindow() {
     height: 944,
     minWidth: 1100,
     minHeight: 700,
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     backgroundColor: '#f8f8f0',
     // macOS swallows the click that activates a background window. Autome's
     // windows lose focus constantly — every session opens a terminal that
@@ -264,8 +264,40 @@ async function openPath(params) {
 
 // The two commands a user can have run for them, both in a visible terminal
 // so they can see exactly what happened (requirement E-02, E-03).
-async function runInTerminal(command, title) {
+async function runInTerminal(command, title, powershell = false) {
   const { spawn } = require('node:child_process');
+  if (process.platform === 'win32') {
+    const hasWT = (() => {
+      try {
+        const { execSync } = require('node:child_process');
+        execSync('where wt.exe', { stdio: 'ignore' });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+
+    let executable;
+    let args;
+    if (hasWT) {
+      executable = 'wt.exe';
+      const shellExe = powershell ? 'powershell.exe' : (process.env.ComSpec || 'cmd.exe');
+      const shellArgs = powershell
+        ? ['-NoProfile', '-NoExit', '-Command', command]
+        : ['/d', '/k', command];
+      args = ['--title', title || 'autome', shellExe, ...shellArgs];
+    } else {
+      executable = powershell ? 'powershell.exe' : process.env.ComSpec || 'cmd.exe';
+      args = powershell ? ['-NoProfile', '-NoExit', '-Command', command] : ['/d', '/k', command];
+    }
+
+    const child = spawn(executable, args, {
+      detached: true, stdio: 'ignore', windowsHide: false,
+    });
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref();
+    return { terminal: hasWT ? 'Windows Terminal' : (powershell ? 'PowerShell' : 'Windows Command Prompt') };
+  }
   const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const useITerm = require('node:fs').existsSync('/Applications/iTerm.app');
   const script = useITerm
@@ -326,6 +358,20 @@ async function openTerminal(params) {
   // store.rs), so the most recent one is at index 0, not at the end.
   const sessions = payload.sessions || [];
   const session = sessions.find((s) => s.running) || sessions[0];
+
+  if (process.platform === 'win32') {
+    const quote = (value) => `'${String(value).replace(/'/g, "''")}'`;
+    const parts = [`Set-Location -LiteralPath ${quote(worktree)}`];
+    if (session) {
+      const log = await callCore('session.log', { session_id: session.id });
+      if (log && log.path) {
+        parts.push(`Get-Content -LiteralPath ${quote(log.path)} -Tail ${TERMINAL_LOG_LINES}${session.running ? ' -Wait' : ''}`);
+      }
+    }
+    const command = parts.join('; ');
+    const result = await runInTerminal(command, `autome · ${params.task_id}`, true);
+    return { ...result, command, worktree, session: session ? session.id : null };
+  }
 
   const parts = [`cd ${shellQuote(worktree)}`];
   if (session) {

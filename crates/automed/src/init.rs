@@ -39,7 +39,7 @@ use autome_domain::protocol::ProtocolFiles;
 /// wrote to the same path and the second one won — and the clauses the core
 /// now checks say so, so that the rules a round has to remember are
 /// distinguishable from the ones it does not.
-pub const SCAFFOLD_VERSION: u32 = 7;
+pub const SCAFFOLD_VERSION: u32 = 8;
 
 const VERSION_MARKER: &str = "autome-scaffold-version:";
 
@@ -173,6 +173,7 @@ pub fn init_kind(repo: &Path, protocol: &ProtocolFiles, workspace: bool) -> Resu
     // the root — outside every member — so no member needs one either.
     if !workspace {
         append_gitignore(repo, &mut report)?;
+        append_script_attributes(repo, &mut report)?;
     }
     append_agents_md(repo, &mut report)?;
 
@@ -185,6 +186,42 @@ fn create_dir(repo: &Path, rel: &str) -> Result<()> {
         path: rel.to_string(),
         detail: e.to_string(),
     })
+}
+
+fn append_script_attributes(repo: &Path, report: &mut InitReport) -> Result<()> {
+    let path = repo.join(".gitattributes");
+    let mut contents = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(InitError {
+                path: ".gitattributes".into(),
+                detail: e.to_string(),
+            });
+        }
+    };
+    let rule = ".autome/skill/*.sh text eol=lf";
+    let action = if contents.lines().any(|line| line.trim() == rule) {
+        Action::Kept
+    } else {
+        let existed = path.exists();
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(rule);
+        contents.push('\n');
+        write(&path, &contents, ".gitattributes")?;
+        if existed {
+            Action::Appended
+        } else {
+            Action::Created
+        }
+    };
+    report.steps.push(InitStep {
+        path: ".gitattributes".into(),
+        action,
+    });
+    Ok(())
 }
 
 fn write_if_absent(repo: &Path, rel: &str, contents: &str, report: &mut InitReport) -> Result<()> {
@@ -476,6 +513,12 @@ fn run_session_sh() -> String {
 # 职责：写 pid → 执行 CLI 并把输出 tee 到日志 → 无论如何都写退出标记。
 
 set -u
+# Non-login Git Bash does not add its tools to the inherited Windows PATH.
+case "${{OSTYPE:-}}" in
+  msys*|cygwin*) export PATH="/mingw64/bin:/usr/bin:/bin:$PATH" ;;
+esac
+export MSYS_NO_PATHCONV=1
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 
 if [ $# -lt 6 ]; then
   echo "run_session.sh: 参数不足" >&2
@@ -526,7 +569,11 @@ on_signal() {{
 }}
 trap on_signal INT TERM HUP
 
-echo $$ > "$pid_file"
+if [ -r /proc/$$/winpid ]; then
+  cat /proc/$$/winpid > "$pid_file"
+else
+  echo $$ > "$pid_file"
+fi
 
 printf '=== autome session %s (%s) started %s ===\n' \
   "$session_id" "$runtime" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$log"
@@ -679,6 +726,18 @@ mod tests {
         );
         assert!(!second.changed());
         assert_eq!(dir.read("AGENTS.md"), before);
+    }
+
+    #[test]
+    fn init_preserves_user_attributes_and_adds_script_lf_once() {
+        let dir = TempDir::new("attributes");
+        std::fs::write(dir.path().join(".gitattributes"), "*.png binary").unwrap();
+        init(dir.path()).unwrap();
+        init(dir.path()).unwrap();
+        assert_eq!(
+            dir.read(".gitattributes"),
+            "*.png binary\n.autome/skill/*.sh text eol=lf\n"
+        );
     }
 
     #[test]
@@ -884,7 +943,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         init(&dir).unwrap();
         let wrapper = wrapper_script(&dir);
-        let out = std::process::Command::new("sh")
+        #[cfg(windows)]
+        let mut cmd =
+            std::process::Command::new(crate::launcher::git_bash_path().expect("Git Bash"));
+        #[cfg(not(windows))]
+        let mut cmd = std::process::Command::new("sh");
+        let out = cmd
             .arg(&wrapper)
             .arg("s1")
             // A path under a directory that does not exist and cannot be made.

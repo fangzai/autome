@@ -542,6 +542,7 @@ body.offline .btn--primary, body.offline .btn--danger, body.offline .btn--go, bo
 .cardgrid--2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
 .cardgrid--3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
 .cardgrid--4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.cardgrid--5 { grid-template-columns: repeat(5, minmax(0,1fr)); }
 .cardgrid > * { min-width: 0; }
 .card--link { cursor: pointer; } .card--link:hover { transform: translateY(-2px); }
 .card--link:focus-visible { outline: 2px solid var(--animal-primary); outline-offset: 2px; }

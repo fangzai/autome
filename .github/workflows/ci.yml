@@ -12,6 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install desktop test dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Windows build and tests
+        shell: pwsh
+        run: ./scripts/ci-windows.ps1
+
   rust:
     # A hung step must fail in minutes, not sit at the runner's own limit.
     timeout-minutes: 30

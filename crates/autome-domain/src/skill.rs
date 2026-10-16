@@ -140,12 +140,20 @@ pub fn scan_roots(home: &str, repo: &str) -> Vec<(Runtime, Scope, String)> {
         roots.push((
             runtime,
             Scope::Global,
-            format!("{}/{}", home.trim_end_matches('/'), runtime.skill_dir()),
+            format!(
+                "{}/{}",
+                home.trim_end_matches('/'),
+                runtime.global_skill_dir()
+            ),
         ));
         roots.push((
             runtime,
             Scope::Project,
-            format!("{}/{}", repo.trim_end_matches('/'), runtime.skill_dir()),
+            format!(
+                "{}/{}",
+                repo.trim_end_matches('/'),
+                runtime.project_skill_dir()
+            ),
         ));
     }
     roots
@@ -276,12 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_roots_covers_four_directories_two_per_runtime() {
+    fn scan_roots_covers_directories_two_per_runtime() {
         let roots = scan_roots("/Users/x", "/Users/x/code/shop");
-        assert_eq!(roots.len(), 4);
+        assert_eq!(roots.len(), Runtime::ALL.len() * 2);
         let paths: Vec<&str> = roots.iter().map(|(_, _, p)| p.as_str()).collect();
         assert!(paths.contains(&"/Users/x/.claude/skills"));
         assert!(paths.contains(&"/Users/x/.agents/skills"));
+        assert!(paths.contains(&"/Users/x/.gemini/config/skills"));
         assert!(paths.contains(&"/Users/x/code/shop/.claude/skills"));
         assert!(paths.contains(&"/Users/x/code/shop/.agents/skills"));
     }

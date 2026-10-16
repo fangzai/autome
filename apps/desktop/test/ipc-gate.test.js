@@ -148,8 +148,8 @@ test('the component names here are the ones the core puts on the wire', () => {
   );
   assert.match(decl, /serialize_str\(self\.as_str\(\)\)/);
 
-  assert.equal(wireNames.length, labels.COMPONENT_ORDER.length, 'component count差异');
-  for (const name of labels.COMPONENT_ORDER) {
+  assert.equal(wireNames.length, labels.COMPONENT_NAMES.length, 'component count差异');
+  for (const name of labels.COMPONENT_NAMES) {
     assert.ok(wireNames.includes(name), `renderer 用 ${name}，核心发的是 ${wireNames.join(', ')}`);
   }
 });

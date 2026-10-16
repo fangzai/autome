@@ -155,7 +155,9 @@ fn is_file(path: &str) -> bool {
 mod tests {
     use super::*;
 
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A throwaway directory tree, removed when the test ends.
@@ -286,8 +288,11 @@ mod tests {
 
         assert_eq!(inv.len(), 1);
         let skill = inv.get("conventions").unwrap();
-        assert_eq!(skill.visible_to(), vec![Runtime::Claude, Runtime::Codex]);
-        assert_eq!(skill.sources.len(), 2);
+        assert_eq!(
+            skill.visible_to(),
+            vec![Runtime::Claude, Runtime::Codex, Runtime::Agy]
+        );
+        assert_eq!(skill.sources.len(), 3);
     }
 
     #[test]

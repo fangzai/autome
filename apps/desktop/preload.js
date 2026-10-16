@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('autome', {
     protocolVersions: (projectId) => read('protocol.versions')({ project_id: projectId }),
     protocolEval: () => read('protocol.eval')(),
     protocolTriggers: () => read('protocol.triggers')(),
+    runtimeModels: (runtime, refresh = false) => read('runtime.models')({ runtime, refresh }),
   },
 
   write: {

@@ -40,6 +40,7 @@ pub fn render_stream<R: BufRead, W: Write>(
         let rendered = match runtime {
             Runtime::Claude => render_line(&line),
             Runtime::Codex => render_codex_line(&line),
+            Runtime::Agy => render_agy_line(&line),
         };
         if let Some(rendered) = rendered {
             writeln!(output, "{rendered}")?;
@@ -344,6 +345,139 @@ fn truncate(value: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+// ---------------------------------------------------------------------------
+// Antigravity (agy)
+// ---------------------------------------------------------------------------
+
+/// One line of `agy --output-format stream-json`.
+///
+/// Output lines are JSON objects with an `"event"` tag: `"init"`, `"step_update"`,
+/// or `"result"`. Anything that cannot be parsed as JSON is passed through
+/// untouched (CLI warnings on stderr, etc.).
+pub fn render_agy_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed) else {
+        return Some(trimmed.to_string());
+    };
+
+    match object.get("event").and_then(Value::as_str) {
+        Some("init") => render_agy_init(&object),
+        Some("result") => render_agy_result(&object),
+        Some("step_update") => {
+            if let Some(su) = object.get("step_update").and_then(Value::as_object) {
+                render_agy_step_update(su)
+            } else {
+                None
+            }
+        }
+        Some(other) => Some(format!("· {other}")),
+        None => Some(trimmed.to_string()),
+    }
+}
+
+fn render_agy_init(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let init = object.get("init").and_then(Value::as_object)?;
+    let model = init.get("model").and_then(Value::as_str).unwrap_or("?");
+    let mode = init
+        .get("permission_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    Some(format!("=== agy model={model} permission-mode={mode} ==="))
+}
+
+fn render_agy_result(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let res = object.get("result").and_then(Value::as_object)?;
+    let status = res
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("result");
+    let turns = res.get("num_turns").and_then(Value::as_u64);
+    let secs = res.get("duration_seconds").and_then(Value::as_f64);
+    let response = res
+        .get("response")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+
+    let mut out = String::new();
+    if !response.is_empty() {
+        out.push_str(response);
+        out.push('\n');
+    }
+
+    let mut banner = format!("=== agy {status}");
+    if let Some(turns) = turns {
+        banner.push_str(&format!(" · {turns} 轮"));
+    }
+    if let Some(secs) = secs {
+        banner.push_str(&format!(" · {:.1}s", secs));
+    }
+    if let Some(usage) = res.get("usage") {
+        let in_tok = usage.get("input_tokens").and_then(Value::as_u64);
+        let out_tok = usage.get("output_tokens").and_then(Value::as_u64);
+        if let (Some(i), Some(o)) = (in_tok, out_tok) {
+            banner.push_str(&format!(" · in {i} out {o}"));
+        }
+    }
+    banner.push_str(" ===");
+    out.push_str(&banner);
+    Some(out)
+}
+
+fn render_agy_step_update(su: &serde_json::Map<String, Value>) -> Option<String> {
+    let step_type = su.get("step_type").and_then(Value::as_str).unwrap_or("");
+    let state = su.get("state").and_then(Value::as_str).unwrap_or("");
+
+    if let Some(tool) = su.get("tool_call").or_else(|| su.get("tool")) {
+        let name = tool
+            .get("name")
+            .or_else(|| tool.get("tool_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let input = tool
+            .get("args")
+            .or_else(|| tool.get("input"))
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        return Some(format!("→ {} {}", name, truncate(&input, TOOL_SUMMARY_MAX)));
+    }
+    if let Some(name) = su.get("tool_name").and_then(Value::as_str) {
+        let input = su
+            .get("tool_args")
+            .or_else(|| su.get("args"))
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        return Some(format!("→ {} {}", name, truncate(&input, TOOL_SUMMARY_MAX)));
+    }
+
+    if let Some(err) = su.get("error").and_then(Value::as_str) {
+        return Some(format!("  ✗ {}", truncate(err, TOOL_ERROR_MAX)));
+    }
+
+    match step_type {
+        "reasoning" | "thinking" => {
+            if state == "ACTIVE" || state == "started" {
+                Some("→ (thinking)".to_string())
+            } else {
+                None
+            }
+        }
+        "user_input" => None,
+        "agent_response" => None,
+        other if !other.is_empty() => {
+            if state == "DONE" {
+                Some(format!("· {other}"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +709,39 @@ mod tests {
         assert_eq!(
             render_codex_line(r#"{"type":"assistant","message":{"content":[]}}"#).as_deref(),
             Some("· assistant")
+        );
+    }
+
+    #[test]
+    fn an_agy_init_and_result_renders_clearly() {
+        let init = r#"{"event":"init","init":{"model":"gemini-3.8-flash-low","permission_mode":"always-proceed"}}"#;
+        assert_eq!(
+            render_agy_line(init).as_deref(),
+            Some("=== agy model=gemini-3.8-flash-low permission-mode=always-proceed ===")
+        );
+
+        let result = r#"{"event":"result","result":{"status":"SUCCESS","response":"Hello! How can I help you today?","duration_seconds":3.5,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":20}}}"#;
+        let out = render_agy_line(result).unwrap();
+        assert!(out.contains("Hello! How can I help you today?"));
+        assert!(out.contains("=== agy SUCCESS · 1 轮 · 3.5s · in 100 out 20 ==="));
+    }
+
+    #[test]
+    fn an_agy_step_update_renders_tools_and_thinking() {
+        let thinking =
+            r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"thinking"}}"#;
+        assert_eq!(render_agy_line(thinking).as_deref(), Some("→ (thinking)"));
+
+        let tool = r#"{"event":"step_update","step_update":{"state":"ACTIVE","tool_call":{"name":"run_command","args":{"cmd":"cargo test"}}}}"#;
+        let rendered = render_agy_line(tool).unwrap();
+        assert!(rendered.starts_with("→ run_command"));
+        assert!(rendered.contains("cargo test"));
+
+        let err =
+            r#"{"event":"step_update","step_update":{"state":"DONE","error":"permission denied"}}"#;
+        assert_eq!(
+            render_agy_line(err).as_deref(),
+            Some("  ✗ permission denied")
         );
     }
 }

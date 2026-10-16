@@ -211,8 +211,8 @@ function validateOpSpecific(op, params) {
     return { ok: false, message: 'theme must be one of system, light, dark' };
   }
   if (op === 'env.install' || op === 'env.login') {
-    if (!['git', 'claude', 'codex', 'iterm2'].includes(params.component)) {
-      return { ok: false, message: 'component must be one of git, claude, codex, iterm2' };
+    if (!['git', 'claude', 'codex', 'iterm2', 'git_bash', 'agy'].includes(params.component)) {
+      return { ok: false, message: 'component must be one of git, claude, codex, iterm2, git_bash, agy' };
     }
   }
   if (op === 'task.decide') {
@@ -241,8 +241,8 @@ function validateOpSpecific(op, params) {
     if (!ROLES.includes(params.role)) {
       return { ok: false, message: 'unknown role' };
     }
-    if (params.runtime !== undefined && !['claude', 'codex'].includes(params.runtime)) {
-      return { ok: false, message: 'runtime must be claude or codex' };
+    if (params.runtime !== undefined && !['claude', 'codex', 'agy'].includes(params.runtime)) {
+      return { ok: false, message: 'runtime must be claude, codex or agy' };
     }
   }
   return { ok: true };

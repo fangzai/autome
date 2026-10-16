@@ -31,6 +31,7 @@ const ALLOWED_READ_METHODS = Object.freeze([
   'protocol.versions',
   'protocol.eval',
   'protocol.triggers',
+  'runtime.models',
 ]);
 
 const TRUSTED_ORIGIN_PREFIX = 'autome://app/';

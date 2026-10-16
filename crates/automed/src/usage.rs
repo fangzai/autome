@@ -34,6 +34,7 @@ pub fn parse(runtime: Runtime, stream: &str, wall_ms: Option<u64>) -> SessionMet
     match runtime {
         Runtime::Claude => parse_claude(stream),
         Runtime::Codex => parse_codex(stream, wall_ms),
+        Runtime::Agy => parse_agy(stream, wall_ms),
     }
 }
 
@@ -171,6 +172,57 @@ fn parse_codex(stream: &str, wall_ms: Option<u64>) -> SessionMetrics {
     m
 }
 
+fn parse_agy(stream: &str, wall_ms: Option<u64>) -> SessionMetrics {
+    let mut m = SessionMetrics::default();
+    let mut request_inputs: Vec<u64> = Vec::new();
+
+    for o in objects(stream) {
+        match o.get("event").and_then(Value::as_str) {
+            Some("step_update") => {
+                let Some(su) = o.get("step_update") else {
+                    continue;
+                };
+                if let Some(usage) = su.get("usage") {
+                    let inp = u64_at(usage, &["input_tokens"]).unwrap_or(0);
+                    let cached = u64_at(usage, &["cache_read_tokens"]).unwrap_or(0);
+                    if inp > 0 || cached > 0 {
+                        request_inputs.push(inp + cached);
+                    }
+                }
+            }
+            Some("result") => {
+                let Some(res) = o.get("result") else {
+                    continue;
+                };
+                m.turns = res.get("num_turns").and_then(Value::as_u64);
+                if let Some(dur_secs) = res.get("duration_seconds").and_then(Value::as_f64) {
+                    m.duration_ms = Some((dur_secs * 1000.0) as u64);
+                }
+                if let Some(usage) = res.get("usage") {
+                    m.input_tokens = u64_at(usage, &["input_tokens"]);
+                    m.cache_read_tokens = u64_at(usage, &["cache_read_tokens"]);
+                    m.output_tokens = u64_at(usage, &["output_tokens"]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if m.duration_ms.is_none() {
+        m.duration_ms = wall_ms;
+    }
+
+    if !request_inputs.is_empty() {
+        let sum: u64 = request_inputs.iter().sum();
+        m.mean_request_input = Some(sum / request_inputs.len() as u64);
+    } else if let Some(inp) = m.input_tokens {
+        let cached = m.cache_read_tokens.unwrap_or(0);
+        m.mean_request_input = Some(inp + cached);
+    }
+
+    m
+}
+
 /// Measures the two file-shaped numbers, which no CLI reports: how big the
 /// design document got, and how many evidence files exist. Both are read at
 /// reap time, from the worktree the session just left.
@@ -214,6 +266,14 @@ mod tests {
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Hello!"}}
 {"type":"turn.completed","usage":{"input_tokens":36111,"cached_input_tokens":12928,"cache_write_input_tokens":0,"output_tokens":6,"reasoning_output_tokens":128}}
+"#;
+
+    /// Captured from agy on 2026-10-16.
+    const AGY: &str = r#"{"event":"init","init":{"model":"gemini-3.8-flash-low","cwd":"D:\\AgentCode\\autome","permission_mode":"always-proceed"}}
+{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hi"}}
+{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"!","duration_seconds":1.2,"usage":{"input_tokens":11620,"output_tokens":11,"thinking_tokens":0,"cache_read_tokens":200,"total_tokens":11831}}}
+{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hi!\n","duration_seconds":1.25,"num_turns":1,"usage":{"input_tokens":11620,"output_tokens":11,"thinking_tokens":0,"cache_read_tokens":200,"total_tokens":11831}}}
 "#;
 
     #[test]
@@ -293,6 +353,19 @@ mod tests {
         assert!(parse(Runtime::Claude, "", None).is_empty());
         assert!(parse(Runtime::Claude, "not json at all\n", None).is_empty());
         assert!(parse(Runtime::Codex, "not json at all\n", None).is_empty());
+        assert!(parse(Runtime::Agy, "not json at all\n", None).is_empty());
+    }
+
+    #[test]
+    fn an_agy_stream_yields_tokens_and_turns() {
+        let m = parse(Runtime::Agy, AGY, None);
+        assert_eq!(m.turns, Some(1));
+        assert_eq!(m.duration_ms, Some(1250));
+        assert_eq!(m.input_tokens, Some(11620));
+        assert_eq!(m.cache_read_tokens, Some(200));
+        assert_eq!(m.output_tokens, Some(11));
+        assert_eq!(m.mean_request_input, Some(11620 + 200));
+        assert_eq!(m.cost_usd, None);
     }
 
     #[test]

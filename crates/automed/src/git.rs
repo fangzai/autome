@@ -74,15 +74,28 @@ fn sanitised_env() -> BTreeMap<String, String> {
     // No user or system config: a `merge.tool`, `core.autocrlf` or alias in
     // the user's ~/.gitconfig must not change what Autome does.
     env.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
-    env.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
-    // Fail closed instead of prompting if anything ever reaches for a remote.
-    env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-    env.insert("GIT_ASKPASS".into(), "/usr/bin/false".into());
-    env.insert("SSH_ASKPASS".into(), "/usr/bin/false".into());
-    // No interactive editor can ever open: a merge or rebase that wants one
-    // must fail rather than hang forever on a terminal nobody is watching.
-    env.insert("GIT_EDITOR".into(), "/usr/bin/true".into());
-    env.insert("GIT_SEQUENCE_EDITOR".into(), "/usr/bin/true".into());
+    #[cfg(windows)]
+    {
+        env.insert("GIT_CONFIG_GLOBAL".into(), "NUL".into());
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        env.insert("GIT_ASKPASS".into(), "".into());
+        env.insert("SSH_ASKPASS".into(), "".into());
+        env.insert("GIT_EDITOR".into(), "true".into());
+        env.insert("GIT_SEQUENCE_EDITOR".into(), "true".into());
+        env.insert("GIT_AUTHOR_NAME".into(), AUTOME_NAME.into());
+        env.insert("GIT_AUTHOR_EMAIL".into(), AUTOME_EMAIL.into());
+        env.insert("GIT_COMMITTER_NAME".into(), AUTOME_NAME.into());
+        env.insert("GIT_COMMITTER_EMAIL".into(), AUTOME_EMAIL.into());
+    }
+    #[cfg(not(windows))]
+    {
+        env.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        env.insert("GIT_ASKPASS".into(), "/usr/bin/false".into());
+        env.insert("SSH_ASKPASS".into(), "/usr/bin/false".into());
+        env.insert("GIT_EDITOR".into(), "/usr/bin/true".into());
+        env.insert("GIT_SEQUENCE_EDITOR".into(), "/usr/bin/true".into());
+    }
     env
 }
 
@@ -120,21 +133,76 @@ fn run_with_binary(
     extra: &[(&str, &str)],
     stdin: Option<&str>,
 ) -> Result<Output> {
+    #[cfg(windows)]
+    let cwd_buf;
+    #[cfg(windows)]
+    let cwd = {
+        let s = cwd.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            cwd_buf = PathBuf::from(stripped);
+            &cwd_buf
+        } else {
+            cwd
+        }
+    };
+    #[cfg(windows)]
+    let args_owned: Vec<String>;
+    #[cfg(windows)]
+    let args_vec: Vec<&str> = {
+        args_owned = args
+            .iter()
+            .map(|a| a.strip_prefix(r"\\?\").unwrap_or(a).to_string())
+            .collect();
+        args_owned.iter().map(|s| s.as_str()).collect()
+    };
+    #[cfg(windows)]
+    let args = &args_vec[..];
+
     let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     let mut cmd = Command::new(binary);
+    #[cfg(windows)]
+    {
+        cmd.args(["-c", "core.longpaths=true", "-c", "core.quotepath=false"]);
+        crate::platform::hide_window(&mut cmd);
+    }
     cmd.current_dir(cwd)
         .args(args)
         .env_clear()
         // PATH is still needed: git shells out to its own subcommands.
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env(
+            "HOME",
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default(),
+        );
+    #[cfg(windows)]
+    {
+        for key in &[
+            "SystemRoot",
+            "windir",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            "ComSpec",
+            "PATHEXT",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+    }
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     for (k, v) in sanitised_env() {
         cmd.env(k, v);
     }
@@ -308,7 +376,15 @@ pub fn is_repo_root(path: &Path) -> bool {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    p
 }
 
 /// `git init -b <branch>`. Used when the chosen directory is not a repository
@@ -910,6 +986,12 @@ mod tests {
             env.get("GIT_CONFIG_NOSYSTEM").map(String::as_str),
             Some("1")
         );
+        #[cfg(windows)]
+        assert_eq!(
+            env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some("NUL")
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
             Some("/dev/null")
@@ -995,7 +1077,12 @@ mod tests {
     /// to ask `sh` for than git.
     #[test]
     fn a_command_that_outlives_its_deadline_is_killed_and_reported() {
-        let child = Command::new("/bin/sh")
+        #[cfg(windows)]
+        let sh = crate::launcher::git_bash_path().expect("Git Bash");
+        #[cfg(not(windows))]
+        let sh = std::path::PathBuf::from("/bin/sh");
+
+        let child = Command::new(&sh)
             .args(["-c", "sleep 30"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1017,6 +1104,7 @@ mod tests {
         // And actually killed it: `kill -0` fails once the process is gone.
         // Reaped by `child.wait()` inside the waiter, so this is not a zombie.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        #[cfg(unix)]
         let alive = Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
@@ -1024,6 +1112,8 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
+        #[cfg(not(unix))]
+        let alive = crate::launcher::pid_alive(pid as i32);
         assert!(!alive, "子进程 {pid} 超时后仍在运行");
     }
 
@@ -1039,9 +1129,14 @@ mod tests {
     /// the baseline however loaded the machine is, so the difference still
     /// tells the two apart when the absolute number cannot.
     #[test]
+    #[cfg(unix)] // Sub-20ms scheduling is not a portable Windows timing guarantee.
     fn a_command_that_finishes_quickly_is_not_held_by_the_poll() {
         fn exits_immediately() -> std::process::Child {
-            Command::new("/bin/sh")
+            #[cfg(windows)]
+            let sh = crate::launcher::git_bash_path().expect("Git Bash");
+            #[cfg(not(windows))]
+            let sh = std::path::PathBuf::from("/bin/sh");
+            Command::new(sh)
                 .args(["-c", "exit 0"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())

@@ -745,6 +745,36 @@ async function run() {
     { ...sameModel, expectedRoleNodes: ROLE_COUNT }
   );
 
+  // Model discovery failure remains selectable and effort follows agy model suffixes.
+  const modelFailure = await evaluate(async () => {
+    document.querySelector('[data-node="impl"]').click();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const drawer = document.getElementById('drawer');
+    const selects = drawer.querySelectorAll('select');
+    selects[0].value = 'agy';
+    selects[0].dispatchEvent(new Event('change', { bubbles: true }));
+    const modelSelect = selects[1];
+    const option = document.createElement('option');
+    option.value = 'gemini-4-high';
+    option.textContent = 'gemini-4-high';
+    modelSelect.appendChild(option);
+    modelSelect.value = 'gemini-4-high';
+    modelSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const result = {
+      model: modelSelect.value,
+      effortDisabled: selects[2].disabled,
+      error: drawer.textContent.includes('模型查询失败'),
+      refresh: Array.from(drawer.querySelectorAll('button')).some(b => b.textContent === '刷新模型' && !b.disabled),
+    };
+    const { close } = await import('autome://app/lib/overlay.js');
+    if (close) close();
+    return result;
+  });
+  check('agy model query failure preserves selectable model and suffix effort rules',
+    modelFailure.model === 'gemini-4-high' && modelFailure.effortDisabled && modelFailure.error && modelFailure.refresh,
+    modelFailure);
+
   // ---- the usage card, and what the two gates have to disclose ----------
   //
   // Every number is absent rather than zero when nothing measured it. A task

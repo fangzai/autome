@@ -117,15 +117,21 @@ impl ProtocolFiles {
         P: Into<String>,
         C: Into<String>,
     {
-        let mut files = BTreeMap::new();
+        let mut s = Self::new();
         for (path, content) in pairs {
-            files.insert(path.into(), content.into());
+            s.insert(path, content);
         }
-        Self { files }
+        s
     }
 
     pub fn insert(&mut self, path: impl Into<String>, content: impl Into<String>) {
-        self.files.insert(path.into(), content.into());
+        let content_str: String = content.into();
+        let normalized = if content_str.contains('\r') {
+            content_str.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            content_str
+        };
+        self.files.insert(path.into(), normalized);
     }
 
     pub fn remove(&mut self, path: &str) -> Option<String> {
@@ -175,7 +181,13 @@ impl ProtocolFiles {
         SIZED_FILES
             .iter()
             .filter_map(|f| self.get(f))
-            .map(str::len)
+            .map(|text| {
+                if text.contains('\r') {
+                    text.replace("\r\n", "\n").replace('\r', "\n").len()
+                } else {
+                    text.len()
+                }
+            })
             .sum()
     }
 

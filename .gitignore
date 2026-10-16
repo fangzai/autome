@@ -12,3 +12,7 @@ apps/desktop/dist/
 
 # Claude Code scratch worktrees
 .claude/worktrees/
+finds.md 
+progress.md
+task_plan.md
+windows_port_plan*.md

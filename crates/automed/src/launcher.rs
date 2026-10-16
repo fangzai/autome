@@ -24,6 +24,8 @@ use autome_domain::role::Runtime;
 use autome_domain::session::{SessionKind, SessionPaths};
 use autome_domain::task::Inject;
 
+#[cfg(windows)]
+use crate::platform::windows as win_proc;
 use crate::store::DecisionRecord;
 
 #[derive(Debug)]
@@ -159,7 +161,10 @@ fn git_dir_outside(cwd: &Path) -> Option<PathBuf> {
         return None;
     }
     let dir = PathBuf::from(out.line());
-    if dir.as_os_str().is_empty() || !dir.is_absolute() || dir.starts_with(cwd) {
+    if dir.as_os_str().is_empty()
+        || !dir.is_absolute()
+        || crate::platform::path_is_within(&dir, cwd)
+    {
         return None;
     }
     Some(dir)
@@ -177,44 +182,10 @@ fn git_dir_outside(cwd: &Path) -> Option<PathBuf> {
 ///   `--sandbox <read-only|workspace-write|danger-full-access>`;
 ///   `workspace-write` is what lets a session edit its own worktree.
 /// - Both take the prompt on stdin when it is not given as an argument.
-pub const ADAPTERS: [RuntimeAdapter; 2] = [
+pub const ADAPTERS: [RuntimeAdapter; 3] = [
     RuntimeAdapter {
         runtime: Runtime::Claude,
         binary: "claude",
-        // `-p` is non-interactive mode.
-        //
-        // `acceptEdits` alone was wrong, and the comment here used to claim it
-        // "lets the session edit files and run commands" — only the first half
-        // was true. Bash was denied, so an implementation round could write
-        // Swift but never compile it, never run a test, never commit. The
-        // first real implementation round declared a protocol failure rather
-        // than burn its budget producing no evidence, which was the right call
-        // and is how this was found.
-        //
-        // `--allowedTools Bash` is what unlocks command execution. A pattern
-        // like `Bash(swift *)` looks narrower but is not: tested against 2.1.261,
-        // an `rm -rf` outside the pattern still ran. So the honest choice is
-        // between "no commands" and "all commands", and a tool that cannot run
-        // a build cannot implement anything.
-        //
-        // `--permission-mode auto` is the other candidate and was rejected: it
-        // asks a classifier about each command, which adds latency and a new
-        // failure mode — during testing it was rate-limited and refused every
-        // command, exactly the failure being fixed.
-        //
-        // 2.0 deliberately adds no sandbox of its own (design §17): the
-        // confinement is the working directory and the protocol. Note that
-        // Bash is not confined by either — Codex's `workspace-write` is a real
-        // OS sandbox, this is not.
-        //
-        // `--output-format stream-json` (with the `--verbose` it requires) is
-        // what makes the session log a record of the work rather than of its
-        // closing paragraph. In `text` mode `claude -p` prints only the final
-        // summary: a round that edited a dozen files left a 3 KB log, against
-        // 300 KB for the same work on Codex, which streams its execution. With
-        // sessions headless that log is the only place to see what happened.
-        // The wrapper pipes the stream through `automed render-stream` to make
-        // it readable and keeps the raw JSONL beside it.
         autonomous_flags: &[
             "-p",
             "--permission-mode",
@@ -233,18 +204,26 @@ pub const ADAPTERS: [RuntimeAdapter; 2] = [
     RuntimeAdapter {
         runtime: Runtime::Codex,
         binary: "codex",
-        // `--json` is what makes a Codex session measurable. Without it the
-        // stream is prose written for a person: no usage, no turn count,
-        // nothing the core can record — so every Codex round was invisible to
-        // the version page while every Claude round was not, which would have
-        // made the two runtimes incomparable in the one direction that
-        // matters. The wrapper renders the JSONL back into prose for the log.
         autonomous_flags: &["exec", "--json", "--sandbox", "workspace-write"],
         model_flag: "--model",
         // Codex takes reasoning effort as a config override rather than a
         // dedicated flag.
         effort_flag: Some("--config"),
         no_repo_flag: Some("--skip-git-repo-check"),
+    },
+    RuntimeAdapter {
+        runtime: Runtime::Agy,
+        binary: "agy",
+        autonomous_flags: &[
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "-p",
+            "-",
+        ],
+        model_flag: "--model",
+        effort_flag: Some("--effort"),
+        no_repo_flag: None,
     },
 ];
 
@@ -287,12 +266,22 @@ pub fn build_args(config: &RoleConfig, cwd: &Path, worktrees: &[&Path]) -> Vec<S
         args.push(config.model.clone());
     }
     if let (Some(flag), Some(effort)) = (a.effort_flag, config.effort.as_ref()) {
-        args.push(flag.to_string());
-        // Codex takes effort as a config override rather than a bare flag.
-        args.push(match config.runtime {
-            Runtime::Codex => format!("model_reasoning_effort={effort}"),
-            Runtime::Claude => effort.clone(),
-        });
+        let has_model_effort = if config.runtime == Runtime::Agy {
+            let m = config.model.to_ascii_lowercase();
+            ["-low", "-medium", "-high", "-xhigh", "-max"]
+                .iter()
+                .any(|s| m.ends_with(s))
+        } else {
+            false
+        };
+        if !has_model_effort {
+            args.push(flag.to_string());
+            // Codex takes effort as a config override rather than a bare flag.
+            args.push(match config.runtime {
+                Runtime::Codex => format!("model_reasoning_effort={effort}"),
+                Runtime::Claude | Runtime::Agy => effort.clone(),
+            });
+        }
     }
     args
 }
@@ -670,6 +659,7 @@ pub struct Launched {
     /// Which terminal actually took the session, for the message that tells
     /// the user where to look.
     pub terminal: Terminal,
+    pub pid: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,6 +710,7 @@ pub fn launch(spec: &LaunchSpec<'_>) -> Result<Launched> {
             log_path: log_path.to_string_lossy().into_owned(),
             prompt_path: prompt_path.to_string_lossy().into_owned(),
             terminal: Terminal::Dry,
+            pid: None,
         });
     }
 
@@ -728,22 +719,23 @@ pub fn launch(spec: &LaunchSpec<'_>) -> Result<Launched> {
         .ok_or_else(|| err(format!("PATH 中找不到 {binary}，请先在本地环境页安装")))?;
 
     let mut argv = vec![
-        wrapper.to_string_lossy().into_owned(),
+        crate::platform::shell_path(&wrapper),
         spec.session_id.to_string(),
-        session_dir.to_string_lossy().into_owned(),
+        crate::platform::shell_path(&session_dir),
         spec.runtime.as_str().to_string(),
-        renderer_path(),
-        resolved_binary,
-        prompt_path.to_string_lossy().into_owned(),
+        crate::platform::shell_path(Path::new(&renderer_path())),
+        crate::platform::shell_path(Path::new(&resolved_binary)),
+        crate::platform::shell_path(&prompt_path),
     ];
     argv.extend(spec.args.iter().cloned());
 
-    let terminal = run_in_terminal(&argv, spec.cwd)?;
+    let pid = run_in_terminal(&argv, spec.cwd)?;
 
     Ok(Launched {
         log_path: log_path.to_string_lossy().into_owned(),
         prompt_path: prompt_path.to_string_lossy().into_owned(),
-        terminal,
+        terminal: Terminal::Headless,
+        pid: Some(pid),
     })
 }
 
@@ -754,6 +746,9 @@ pub fn launch(spec: &LaunchSpec<'_>) -> Result<Launched> {
 /// through unchanged. A raw JSONL log is ugly but complete, and that is a far
 /// better failure than a session that will not start.
 fn renderer_path() -> String {
+    if let Ok(path) = std::env::var("AUTOMED_RENDERER_BINARY") {
+        return path;
+    }
     std::env::current_exe()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
@@ -763,30 +758,68 @@ fn renderer_path() -> String {
 /// Starts the wrapper detached, with no window at all — the only non-dry mode
 /// there is. The wrapper tees the CLI's output to the session log, which is
 /// where the task panel looks.
-fn run_in_terminal(argv: &[String], cwd: &Path) -> Result<Terminal> {
+fn run_in_terminal(argv: &[String], cwd: &Path) -> Result<i32> {
+    #[cfg(not(windows))]
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .current_dir(cwd)
+    #[cfg(not(windows))]
+    cmd.args(&argv[1..]);
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let bash = git_bash_path().map_err(|e| err(e.to_string()))?;
+        let mut c = Command::new(bash);
+        c.arg(crate::platform::shell_path(Path::new(&argv[0])));
+        c.args(&argv[1..]);
+        c
+    };
+
+    let diagnostic = Path::new(&argv[2]).join(format!("{}.startup.log", argv[1]));
+    let stderr =
+        std::fs::File::create(&diagnostic).map_err(|e| err(format!("无法创建启动诊断：{e}")))?;
+    cmd.current_dir(crate::platform::shell_path(cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // A session runs `git` itself — that is how a round's work gets committed
-    // — and `GIT_DIR`, `GIT_INDEX_FILE` and their relatives override the
-    // directory it is standing in. Whatever set them, it was not the user
-    // asking for this round to commit somewhere else.
-    //
-    // This is not hypothetical: a Git hook exports them, so a core started
-    // from one hands every session a git pointed at the hook's repository.
-    // Found because the end-to-end suite runs from a post-commit hook, where
-    // the one test that did not swallow git's exit code reported 128 — and
-    // the ones that did swallow it had been passing for the wrong reason.
-    //
-    // The core's own git calls were never exposed: `git::run` clears the
-    // environment outright. This is the other half of the same rule.
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW | 0x00000004); // CREATE_SUSPENDED: assign the Job before any fork
+    }
+
     strip_git_env(&mut cmd);
-    cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|e| err(format!("无法启动包装脚本：{e}")))?;
-    Ok(Terminal::Headless)
+    #[cfg(windows)]
+    let mut child = child;
+    let pid = child.id() as i32;
+    #[cfg(windows)]
+    {
+        let identity_path = Path::new(&argv[2]).join(format!("{}.identity", argv[1]));
+        if let Err(e) = win_proc::start_job(&mut child, &identity_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err(format!("无法建立会话进程组：{e}")));
+        }
+    }
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+#[cfg(windows)]
+pub fn git_bash_path() -> std::io::Result<PathBuf> {
+    crate::platform::git_bash()
 }
 
 /// Removes every `GIT_*` variable from a child's environment.
@@ -849,6 +882,7 @@ pub fn resolve_binary(runtime: Runtime) -> Option<String> {
     let var = match runtime {
         Runtime::Claude => "AUTOMED_CLAUDE_BINARY",
         Runtime::Codex => "AUTOMED_CODEX_BINARY",
+        Runtime::Agy => "AUTOMED_AGY_BINARY",
     };
     if let Ok(path) = std::env::var(var)
         && !path.is_empty()
@@ -865,21 +899,9 @@ pub fn which(binary: &str) -> Option<String> {
     which_in(binary, &path, is_executable)
 }
 
-/// The testable core of `which`: PATH scanning against an injected
-/// executability predicate.
 pub fn which_in(binary: &str, path_var: &str, is_exec: impl Fn(&Path) -> bool) -> Option<String> {
-    for dir in path_var.split(':') {
-        // An empty PATH segment means the current directory in POSIX. For a
-        // daemon that is a foot-gun, so it is skipped rather than honoured.
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = PathBuf::from(dir).join(binary);
-        if is_exec(&candidate) {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
+    crate::platform::find_on_path(path_var, binary, is_exec)
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -916,6 +938,37 @@ pub fn stop_session(pid: i32) -> Result<()> {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
+    #[cfg(windows)]
+    {
+        let descendants = win_proc::descendants(pid as u32).map_err(|e| err(e.to_string()))?;
+        let taskkill =
+            PathBuf::from(std::env::var_os("SystemRoot").ok_or_else(|| err("缺少 SystemRoot"))?)
+                .join("System32/taskkill.exe");
+        let mut command = Command::new(taskkill);
+        crate::platform::hide_window(&mut command);
+        let output = command
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .map_err(|e| err(format!("无法终止会话：{e}")))?;
+        if !output.status.success() {
+            return Err(err(format!(
+                "终止进程树失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(pid)
+            || descendants.iter().any(|(pid, created)| {
+                win_proc::is_alive(*pid)
+                    && win_proc::creation_time(*pid).is_ok_and(|time| time == *created)
+            })
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(err("终止会话超时"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     Ok(())
 }
 
@@ -928,17 +981,54 @@ pub fn pid_alive(pid: i32) -> bool {
     unsafe {
         libc::kill(pid, 0) == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        win_proc::is_alive(pid as u32)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
 }
 
+/// Stop only the process originally launched for this session. Old sessions without
+/// an identity are refused on Windows rather than risking a reused PID.
+pub fn stop_owned_session(pid: i32, log_path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let identity = std::fs::read_to_string(log_path.with_extension("identity"))
+            .map_err(|e| err(format!("无法确认会话进程身份，保留工作目录：{e}")))?;
+        let (saved_pid, created) = identity
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| err("无效的进程身份"))?;
+        if saved_pid.parse::<i32>().ok() != Some(pid) {
+            return Err(err("会话 PID 身份不匹配"));
+        }
+        let created: u64 = created.parse().map_err(|_| err("无效的进程创建时间"))?;
+        win_proc::stop_job(pid as u32, created).map_err(|e| err(format!("停止会话进程组失败：{e}")))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = log_path;
+        stop_session(pid)
+    }
+}
+
+#[cfg(windows)]
+pub fn hold_session_job(pid: u32, created: u64) -> std::io::Result<()> {
+    win_proc::hold_job(pid, created)
+}
+
 /// The fixed profile the two system sessions run under.
 pub fn system_role_config() -> RoleConfig {
+    let runtime = [Runtime::Claude, Runtime::Agy, Runtime::Codex]
+        .into_iter()
+        .find(|r| resolve_binary(*r).is_some())
+        .unwrap_or(Runtime::Claude);
     RoleConfig {
         enabled: true,
-        runtime: Runtime::Claude,
+        runtime,
         // Empty means "whatever the CLI defaults to", which is right for a
         // step that is not part of the configurable Loop (requirement C-04).
         model: String::new(),
@@ -951,6 +1041,89 @@ pub fn system_role_config() -> RoleConfig {
 mod tests {
     use super::*;
     use autome_domain::task::Disposition;
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_windows_session_checks_identity_and_reaps_its_children() {
+        let dir = std::env::temp_dir().join(format!("autome stop 中文 {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hang.sh");
+        std::fs::write(&script, "export PATH=/usr/bin:/bin:$PATH\nsleep 60 &\nchild=$!\ncat /proc/$child/winpid > \"$2/child.pid\"\nwait\n").unwrap();
+        let args = vec![
+            crate::platform::shell_path(&script),
+            "test".into(),
+            crate::platform::shell_path(&dir),
+        ];
+        let pid = run_in_terminal(&args, &dir).unwrap();
+        struct Cleanup(i32, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if pid_alive(self.0) {
+                    let _ = stop_session(self.0);
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(pid, dir.clone());
+        let identity_path = dir.join("test.identity");
+        let identity = std::fs::read_to_string(&identity_path).unwrap();
+        std::fs::write(&identity_path, "reused-pid").unwrap();
+        assert!(stop_owned_session(pid, &dir.join("test.log")).is_err());
+        assert!(
+            pid_alive(pid),
+            "identity mismatch must not kill the process"
+        );
+        std::fs::write(identity_path, identity).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let child = loop {
+            if let Ok(text) = std::fs::read_to_string(dir.join("child.pid"))
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not start");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(pid_alive(child));
+        stop_owned_session(pid, &dir.join("test.log")).unwrap();
+        assert!(
+            !pid_alive(pid),
+            "pid={pid}, creation={:?}",
+            win_proc::creation_time(pid as u32)
+        );
+        assert!(
+            !pid_alive(child),
+            "child={child}, creation={:?}",
+            win_proc::creation_time(child as u32)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_session_can_be_stopped_before_the_wrapper_writes_a_pid() {
+        let dir =
+            std::env::temp_dir().join(format!("autome-immediate-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hang.sh");
+        std::fs::write(&script, "export PATH=/usr/bin:/bin:$PATH\nsleep 60\n").unwrap();
+        let args = vec![
+            crate::platform::shell_path(&script),
+            "test".into(),
+            crate::platform::shell_path(&dir),
+        ];
+        let pid = run_in_terminal(&args, &dir).unwrap();
+        let result = stop_owned_session(pid, &dir.join("test.log"));
+        if result.is_err() {
+            let _ = stop_session(pid);
+        }
+        result.unwrap();
+        assert!(
+            !pid_alive(pid),
+            "pid={pid}, creation={:?}",
+            win_proc::creation_time(pid as u32)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn role_config(runtime: Runtime, model: &str, effort: Option<&str>) -> RoleConfig {
         RoleConfig {
@@ -1092,7 +1265,13 @@ mod tests {
         // the same outcome one step later. Asserting only that some path is
         // there is what let that ship.
         let common = repo.join(".git");
-        assert!(args.contains(common.to_str().unwrap()), "{args}");
+        let common_str = common
+            .to_str()
+            .unwrap()
+            .replace('\\', "/")
+            .replace("//?/", "");
+        let args_norm = args.replace('\\', "/");
+        assert!(args_norm.contains(&common_str), "{args}");
         assert!(
             !args.contains("worktrees"),
             "asked for the per-worktree directory, which cannot hold the objects: {args}"
@@ -1701,8 +1880,13 @@ mod tests {
             "中文 路径/带空格",
             "\"double\"",
         ];
+        #[cfg(windows)]
+        let sh = git_bash_path().expect("Git Bash");
+        #[cfg(not(windows))]
+        let sh = PathBuf::from("/bin/sh");
+
         for input in inputs {
-            let out = Command::new("/bin/sh")
+            let out = Command::new(&sh)
                 .arg("-c")
                 .arg(format!("printf %s {}", sh_quote(input)))
                 .output()
@@ -1720,8 +1904,16 @@ mod tests {
     /// element as one argument, whatever is in it.
     #[test]
     fn a_quoted_command_line_reaches_the_program_as_distinct_arguments() {
+        #[cfg(windows)]
+        let sh_str = git_bash_path()
+            .expect("Git Bash")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(not(windows))]
+        let sh_str = "/bin/sh".to_string();
+
         let argv = vec![
-            "/bin/sh".to_string(),
+            sh_str.clone(),
             "-c".to_string(),
             "printf '%s\\n' \"$@\"".to_string(),
             "--".to_string(),
@@ -1729,8 +1921,9 @@ mod tests {
             "it's second".to_string(),
             "$(echo pwned)".to_string(),
         ];
-        let line = shell_command(&argv, Path::new("/tmp"));
-        let out = Command::new("/bin/sh")
+        let cwd = std::env::temp_dir();
+        let line = shell_command(&argv, &cwd);
+        let out = Command::new(&sh_str)
             .arg("-c")
             .arg(&line)
             .output()
@@ -1782,27 +1975,51 @@ mod tests {
 
     #[test]
     fn which_in_returns_the_first_executable_match() {
-        let found = which_in("claude", "/a:/b:/c", |p| {
-            p == Path::new("/b/claude") || p == Path::new("/c/claude")
-        });
-        assert_eq!(found.as_deref(), Some("/b/claude"));
+        let found = which_in(
+            "claude",
+            &std::env::join_paths(["/a", "/b", "/c"])
+                .unwrap()
+                .to_string_lossy(),
+            |p| p == Path::new("/b/claude") || p == Path::new("/c/claude"),
+        );
+        assert_eq!(found.map(PathBuf::from), Some(PathBuf::from("/b/claude")));
     }
 
     #[test]
     fn which_in_skips_empty_path_segments() {
         use std::cell::RefCell;
         let seen = RefCell::new(Vec::new());
-        let found = which_in("x", "::/a", |p| {
-            seen.borrow_mut().push(p.to_string_lossy().into_owned());
-            false
-        });
+        let found = which_in(
+            "x",
+            &std::env::join_paths(["", "", "/a"])
+                .unwrap()
+                .to_string_lossy(),
+            |p| {
+                seen.borrow_mut().push(p.to_string_lossy().into_owned());
+                false
+            },
+        );
         assert_eq!(found, None);
-        assert_eq!(seen.into_inner(), vec!["/a/x".to_string()]);
+        assert!(!seen.borrow().is_empty());
+        assert!(
+            seen.borrow()
+                .iter()
+                .all(|p| Path::new(p).parent() == Some(Path::new("/a")))
+        );
     }
 
     #[test]
     fn which_in_returns_none_when_nothing_matches() {
-        assert_eq!(which_in("ghost", "/a:/b", |_| false), None);
+        assert_eq!(
+            which_in(
+                "ghost",
+                &std::env::join_paths(["/a", "/b"])
+                    .unwrap()
+                    .to_string_lossy(),
+                |_| false
+            ),
+            None
+        );
     }
 
     // ---- misc ------------------------------------------------------------

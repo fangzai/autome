@@ -58,6 +58,8 @@ pub mod launcher;
 pub mod layout;
 pub mod meta;
 pub mod meta_store;
+pub mod models;
+pub mod platform;
 pub mod protocol;
 pub mod scheduler;
 pub mod skills;

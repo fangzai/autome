@@ -119,15 +119,17 @@ impl fmt::Display for Role {
 pub enum Runtime {
     Claude,
     Codex,
+    Agy,
 }
 
 impl Runtime {
-    pub const ALL: [Runtime; 2] = [Runtime::Claude, Runtime::Codex];
+    pub const ALL: [Runtime; 3] = [Runtime::Claude, Runtime::Codex, Runtime::Agy];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Runtime::Claude => "claude",
             Runtime::Codex => "codex",
+            Runtime::Agy => "agy",
         }
     }
 
@@ -140,18 +142,35 @@ impl Runtime {
         match self {
             Runtime::Claude => "Claude Code",
             Runtime::Codex => "Codex",
+            Runtime::Agy => "Agy",
         }
     }
 
-    /// The per-runtime skill directory basename, relative to `$HOME` for the
-    /// global scope and to the repository root for the project scope
-    /// (design §12). Claude reads `.claude/skills`, Codex reads
+    /// The per-runtime skill directory basename in project scope, relative to
+    /// the repository root. Claude reads `.claude/skills`, Codex and Agy read
     /// `.agents/skills`.
-    pub const fn skill_dir(self) -> &'static str {
+    pub const fn project_skill_dir(self) -> &'static str {
         match self {
             Runtime::Claude => ".claude/skills",
             Runtime::Codex => ".agents/skills",
+            Runtime::Agy => ".agents/skills",
         }
+    }
+
+    /// The per-runtime skill directory basename in global scope, relative to
+    /// `$HOME`. Claude reads `.claude/skills`, Codex reads `.agents/skills`,
+    /// Agy reads `.gemini/config/skills`.
+    pub const fn global_skill_dir(self) -> &'static str {
+        match self {
+            Runtime::Claude => ".claude/skills",
+            Runtime::Codex => ".agents/skills",
+            Runtime::Agy => ".gemini/config/skills",
+        }
+    }
+
+    /// Default skill directory for backward compatibility.
+    pub const fn skill_dir(self) -> &'static str {
+        self.project_skill_dir()
     }
 }
 

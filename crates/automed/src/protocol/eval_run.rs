@@ -130,6 +130,7 @@ impl CliRunner {
             grader_runtime: match role_runtime {
                 Runtime::Claude => Runtime::Codex,
                 Runtime::Codex => Runtime::Claude,
+                Runtime::Agy => Runtime::Codex,
             },
         }
     }
@@ -321,7 +322,12 @@ fn scaffold(plan: &Plan<'_>, case: &Case, run: u32) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 {}：{e}", dir.display()))?;
 
     let script = plan.case_dir.join(&case.scaffold);
-    let out = std::process::Command::new("sh")
+    #[cfg(windows)]
+    let mut cmd =
+        std::process::Command::new(crate::launcher::git_bash_path().map_err(|e| e.to_string())?);
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("sh");
+    let out = cmd
         .arg(&script)
         .current_dir(&dir)
         .output()
@@ -362,6 +368,7 @@ fn readable(runtime: Runtime, stream: &str) -> String {
         .filter_map(|l| match runtime {
             Runtime::Claude => crate::stream_render::render_line(l),
             Runtime::Codex => crate::stream_render::render_codex_line(l),
+            Runtime::Agy => crate::stream_render::render_agy_line(l),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -640,6 +647,10 @@ mod tests {
         assert_eq!(
             CliRunner::grading_against(Runtime::Codex).grader_runtime,
             Runtime::Claude
+        );
+        assert_eq!(
+            CliRunner::grading_against(Runtime::Agy).grader_runtime,
+            Runtime::Codex
         );
     }
 

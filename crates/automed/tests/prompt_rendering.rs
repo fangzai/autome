@@ -29,7 +29,9 @@ fn golden(name: &str) -> String {
         "{}/tests/golden/prompts/{name}.md",
         env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{path}: {e}"))
+        .replace("\r\n", "\n")
 }
 
 /// Rewrites a baseline. Deliberately opt-in through the environment rather

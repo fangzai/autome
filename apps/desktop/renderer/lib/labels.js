@@ -59,13 +59,15 @@ export const ROLE_LABELS = {
   retro: '复盘',
 };
 
-export const RUNTIME_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+export const RUNTIME_LABELS = { claude: 'Claude Code', codex: 'Codex', agy: 'Agy' };
 
 export const COMPONENT_LABELS = {
   git: 'Git',
   claude: 'Claude Code',
   codex: 'Codex',
   iterm2: 'iTerm2',
+  git_bash: 'Git Bash',
+  agy: 'Agy',
 };
 
 /** Which roles each component serves — the environment page's 被谁用到 card. */
@@ -74,6 +76,8 @@ export const COMPONENT_NOTE = {
   claude: '设计 · 裁决 · 实现 · 任务整理 · Onboarding',
   codex: '评审 · 审计',
   iterm2: '一键安装与登录命令在其中执行',
+  git_bash: 'Windows 会话包装脚本的必需运行环境',
+  agy: '通用多模型运行环境（Gemini / Claude / GPT 等）',
 };
 
 export const MILESTONE_LABELS = { open: '开放', pending: '待审', done: '已完成' };
@@ -169,6 +173,7 @@ export function taskStatus(task) {
 
 /** The four environment components, in the order the design shows them. */
 export const COMPONENT_ORDER = ['git', 'claude', 'codex', 'iterm2'];
+export const COMPONENT_NAMES = [...COMPONENT_ORDER, 'git_bash', 'agy'];
 
 export function loginLabel(login) {
   if (!login) return null;

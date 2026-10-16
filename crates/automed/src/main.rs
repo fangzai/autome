@@ -26,6 +26,19 @@ fn write_outbound(writer: &mut impl io::Write, outbound: &Outbound) -> Result<()
 const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("session-job-keeper") {
+        let pid = std::env::args().nth(2).and_then(|s| s.parse::<u32>().ok());
+        let created = std::env::args().nth(3).and_then(|s| s.parse::<u64>().ok());
+        if let (Some(pid), Some(created)) = (pid, created) {
+            if let Err(e) = automed::launcher::hold_session_job(pid, created) {
+                eprintln!("session-job-keeper: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        std::process::exit(2);
+    }
     // `automed render-stream` is a filter, not the daemon: the session wrapper
     // pipes a CLI's `stream-json` output through it so the log a human opens
     // is readable. It must produce no tracing noise on stderr — stderr is
@@ -120,6 +133,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| "C:\\".to_string());
+    #[cfg(not(windows))]
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let mut ctx = Ctx::new(store, autome_home, home);
 

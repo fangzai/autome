@@ -24,6 +24,8 @@ pub enum Component {
     Claude,
     Codex,
     ITerm2,
+    GitBash,
+    Agy,
 }
 
 impl Serialize for Component {
@@ -37,18 +39,20 @@ impl<'de> Deserialize<'de> for Component {
         let raw = String::deserialize(d)?;
         Component::parse(&raw).ok_or_else(|| {
             serde::de::Error::custom(format!(
-                "unknown component `{raw}`; expected one of git, claude, codex, iterm2"
+                "unknown component `{raw}`; expected one of git, claude, codex, iterm2, agy"
             ))
         })
     }
 }
 
 impl Component {
-    pub const ALL: [Component; 4] = [
+    pub const ALL: [Component; 6] = [
         Component::Git,
         Component::Claude,
         Component::Codex,
         Component::ITerm2,
+        Component::GitBash,
+        Component::Agy,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -57,7 +61,29 @@ impl Component {
             Component::Claude => "claude",
             Component::Codex => "codex",
             Component::ITerm2 => "iterm2",
+            Component::GitBash => "git_bash",
+            Component::Agy => "agy",
         }
+    }
+
+    pub fn for_windows() -> [Component; 5] {
+        [
+            Component::Git,
+            Component::Claude,
+            Component::Codex,
+            Component::GitBash,
+            Component::Agy,
+        ]
+    }
+
+    pub fn for_macos() -> [Component; 5] {
+        [
+            Component::Git,
+            Component::Claude,
+            Component::Codex,
+            Component::ITerm2,
+            Component::Agy,
+        ]
     }
 
     pub fn parse(s: &str) -> Option<Component> {
@@ -70,6 +96,8 @@ impl Component {
             Component::Claude => "Claude Code",
             Component::Codex => "Codex",
             Component::ITerm2 => "iTerm2",
+            Component::GitBash => "Git Bash",
+            Component::Agy => "Agy",
         }
     }
 
@@ -78,6 +106,7 @@ impl Component {
         match self {
             Component::Claude => Some(Runtime::Claude),
             Component::Codex => Some(Runtime::Codex),
+            Component::Agy => Some(Runtime::Agy),
             _ => None,
         }
     }
@@ -186,8 +215,9 @@ impl Environment {
         let component = match runtime {
             Runtime::Claude => Component::Claude,
             Runtime::Codex => Component::Codex,
+            Runtime::Agy => Component::Agy,
         };
-        self.get(component).is_some_and(|c| c.is_ready())
+        self.can_run_anything() && self.get(component).is_some_and(|c| c.is_ready())
     }
 
     /// The single worst severity, for the dashboard banner.
@@ -214,10 +244,8 @@ impl Environment {
 
     /// Whether any task can start at all.
     pub fn can_run_anything(&self) -> bool {
-        Component::ALL
-            .into_iter()
-            .filter(|c| c.is_required())
-            .all(|c| self.get(c).is_some_and(|s| s.is_ready()))
+        self.get(Component::Git).is_some_and(|s| s.is_ready())
+            && self.get(Component::GitBash).is_none_or(|s| s.is_ready())
     }
 }
 
@@ -238,12 +266,26 @@ pub struct InstallRecipe {
 /// there are four of them and they change with the ecosystem, not with logic.
 pub fn install_recipe(component: Component) -> InstallRecipe {
     match component {
-        Component::Git => InstallRecipe {
-            component,
-            command: "xcode-select --install".into(),
-            prerequisite: None,
-            note: "安装 Xcode 命令行工具，其中包含 git。会弹出系统对话框。".into(),
-        },
+        Component::Git => {
+            #[cfg(windows)]
+            {
+                InstallRecipe {
+                    component,
+                    command: "winget install --id Git.Git --exact".into(),
+                    prerequisite: Some("winget".into()),
+                    note: "安装 Git for Windows；安装后重新启动 Autome。".into(),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                InstallRecipe {
+                    component,
+                    command: "xcode-select --install".into(),
+                    prerequisite: None,
+                    note: "安装 Xcode 命令行工具，其中包含 git。会弹出系统对话框。".into(),
+                }
+            }
+        }
         Component::Claude => InstallRecipe {
             component,
             command: "npm install -g @anthropic-ai/claude-code".into(),
@@ -256,11 +298,23 @@ pub fn install_recipe(component: Component) -> InstallRecipe {
             prerequisite: Some("npm".into()),
             note: "安装后需要执行 codex 登录。".into(),
         },
+        Component::GitBash => InstallRecipe {
+            component,
+            command: "winget install --id Git.Git --exact".into(),
+            prerequisite: Some("winget".into()),
+            note: "安装 Git for Windows（包含会话必需的 Git Bash）；安装后重新启动 Autome。".into(),
+        },
         Component::ITerm2 => InstallRecipe {
             component,
             command: "brew install --cask iterm2".into(),
             prerequisite: Some("brew".into()),
             note: "会话窗口会改用 iTerm2；未安装时暂用系统 Terminal。".into(),
+        },
+        Component::Agy => InstallRecipe {
+            component,
+            command: "agy install".into(),
+            prerequisite: Some("agy".into()),
+            note: "配置已安装 agy 的环境路径和 shell；首次安装请使用实际分发渠道，此命令不会下载 CLI。".into(),
         },
     }
 }
@@ -271,6 +325,7 @@ pub fn login_command(component: Component) -> Option<&'static str> {
     match component {
         Component::Claude => Some("claude /login"),
         Component::Codex => Some("codex login"),
+        Component::Agy => None,
         _ => None,
     }
 }
@@ -435,12 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_maps_back_to_exactly_the_two_cli_components() {
+    fn runtime_maps_back_to_cli_components() {
         let with_runtime: Vec<Component> = Component::ALL
             .into_iter()
             .filter(|c| c.runtime().is_some())
             .collect();
-        assert_eq!(with_runtime, vec![Component::Claude, Component::Codex]);
+        assert_eq!(
+            with_runtime,
+            vec![Component::Claude, Component::Codex, Component::Agy]
+        );
     }
 
     #[test]

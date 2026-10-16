@@ -1239,7 +1239,9 @@ fn start_session(
         mode: ctx.launch_mode,
     })?;
 
-    let pid = read_pid(&repo, &task.id, &session_id);
+    let pid = launched
+        .pid
+        .or_else(|| read_pid(&repo, &task.id, &session_id));
     ctx.store.insert_session(&Session {
         id: session_id.clone(),
         task_id: task.id.clone(),

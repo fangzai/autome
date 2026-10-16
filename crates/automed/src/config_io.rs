@@ -63,6 +63,11 @@ pub fn default_global_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("AUTOME_HOME") {
         return PathBuf::from(dir);
     }
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    #[cfg(not(windows))]
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".autome")
 }

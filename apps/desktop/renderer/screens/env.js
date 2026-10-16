@@ -41,8 +41,8 @@ export function render(host, data, ctx) {
       h('h1.ribbon.ribbon--orange', [h('span.ribbon__front', { text: '本地环境' })]),
       h('span.pagehead__sub', {
         text: probed
-          ? `只检测四样东西 · Homebrew ${prerequisites.brew ? '✓' : '缺失'} · npm ${prerequisites.npm ? '✓' : '缺失'} · 最近检测 ${labels.clock(environment.checked_at) || '—'}`
-          : '只检测四样东西 · 正在检测…（每项最多几秒，检测期间不会挡住其它操作）',
+          ? `检测 ${components.length || 5} 项环境组件 · ${components.some((c) => c.component === 'git_bash') ? 'winget ' + (prerequisites.winget ? '✓' : '缺失') : 'Homebrew ' + (prerequisites.brew ? '✓' : '缺失')} · npm ${prerequisites.npm ? '✓' : '缺失'} · 最近检测 ${labels.clock(environment.checked_at) || '—'}`
+          : '正在检测环境组件…（每项最多几秒，检测期间不会挡住其它操作）',
       }),
       h('div.pagehead__actions', [
         registerWrite(
@@ -55,12 +55,40 @@ export function render(host, data, ctx) {
     ])
   );
 
-  const grid = h('div.cardgrid.cardgrid--4');
-  for (const [index, key] of labels.COMPONENT_ORDER.entries()) {
+  const allKeys = components.length
+    ? components.map((c) => c.component)
+    : labels.COMPONENT_NAMES;
+
+  const isGitTool = (key) => key === 'git' || key === 'git_bash' || key === 'iterm2';
+  const gitKeys = allKeys
+    .filter((k) => isGitTool(k))
+    .sort((a, b) => {
+      const order = { git: 1, git_bash: 2, iterm2: 3 };
+      return (order[a] || 99) - (order[b] || 99);
+    });
+  const modelKeys = allKeys
+    .filter((k) => !isGitTool(k))
+    .sort((a, b) => {
+      const order = { claude: 1, codex: 2, agy: 3 };
+      return (order[a] || 99) - (order[b] || 99);
+    });
+
+  let revealIndex = 1;
+  const gitGridClass = gitKeys.length === 2 ? 'div.cardgrid.cardgrid--2' : 'div.cardgrid';
+  const gitGrid = h(gitGridClass);
+  for (const key of gitKeys) {
     const status = components.find((c) => c.component === key);
-    grid.appendChild(reveal(componentCard(key, status, ctx), index + 1));
+    gitGrid.appendChild(reveal(componentCard(key, status, ctx), revealIndex++));
   }
-  screen.appendChild(grid);
+  screen.appendChild(gitGrid);
+
+  const modelGridClass = modelKeys.length === 3 ? 'div.cardgrid.cardgrid--3.mt-12' : `div.cardgrid.cardgrid--${Math.min(modelKeys.length, 4)}.mt-12`;
+  const modelGrid = h(modelGridClass);
+  for (const key of modelKeys) {
+    const status = components.find((c) => c.component === key);
+    modelGrid.appendChild(reveal(componentCard(key, status, ctx), revealIndex++));
+  }
+  screen.appendChild(modelGrid);
 
   screen.appendChild(sectionHead('被谁用到', '按当前生效的角色路由'));
   screen.appendChild(usageGrid(data));
@@ -182,10 +210,10 @@ function recheck(button, ctx) {
 }
 
 function usageGrid(data) {
-  const grid = h('div.cardgrid.cardgrid--3');
+  const grid = h('div.cardgrid.cardgrid--4');
   const roles = ((data && data.config && data.config.resolved) || {}).roles || [];
 
-  for (const [index, runtime] of ['claude', 'codex'].entries()) {
+  for (const [index, runtime] of ['claude', 'codex', 'agy'].entries()) {
     const using = roles.filter((r) => r.config.runtime === runtime && r.config.enabled);
     const card = h('div.card.card--pad.col');
     const component = (data.environment && (data.environment.components || []).find((c) => c.component === runtime)) || null;
@@ -204,7 +232,9 @@ function usageGrid(data) {
     }
     card.appendChild(lines);
     if (runtime === 'claude') {
-      card.appendChild(h('div.quiet.mt-6', { text: '任务整理与 Onboarding 也固定使用 Claude Code。' }));
+      card.appendChild(h('div.quiet.mt-6', { text: '任务整理与 Onboarding 默认使用 Claude Code。' }));
+    } else if (runtime === 'agy') {
+      card.appendChild(h('div.quiet.mt-6', { text: '通用多模型执行环境，支持 Gemini、Claude、GPT 等。' }));
     }
     grid.appendChild(reveal(card, index + 5));
   }
@@ -212,9 +242,9 @@ function usageGrid(data) {
   const howto = h('div.card.card--pad.col', [cardHead('安装方式')]);
   howto.appendChild(
     h('div.quiet', {
-      text: '一键安装在可见终端里执行，你能看到过程与 sudo 提示。Claude Code 与 Codex 走 npm 全局安装或 Homebrew，iTerm2 走 Homebrew cask，Git 走 Xcode 命令行工具。Homebrew 或 npm 缺失时先提示安装它们。',
+      text: '一键安装在可见终端里执行，你能看到过程与管理员提示。Windows 下优先使用 winget 与 npm，macOS 下使用 Homebrew 与 npm，Agy 可通过官方说明配置。工具缺失时先提示安装前置。',
     })
   );
-  grid.appendChild(reveal(howto, 7));
+  grid.appendChild(reveal(howto, 8));
   return grid;
 }

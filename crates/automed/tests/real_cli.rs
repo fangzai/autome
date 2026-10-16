@@ -219,7 +219,10 @@ fn every_adapter_flag_exists_in_the_cli_it_is_passed_to() {
             .autonomous_flags
             .first()
             .filter(|f| !f.starts_with('-'));
-        let mut cmd = std::process::Command::new(adapter.binary);
+        let bin_path =
+            automed::launcher::which(adapter.binary).unwrap_or_else(|| adapter.binary.to_string());
+        let mut cmd = automed::platform::command(std::path::Path::new(&bin_path))
+            .unwrap_or_else(|_| std::process::Command::new(&bin_path));
         if let Some(sub) = subcommand {
             cmd.arg(sub);
         }
