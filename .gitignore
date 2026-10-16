@@ -16,3 +16,7 @@ finds.md
 progress.md
 task_plan.md
 windows_port_plan*.md
+
+# Autome
+.worktree/
+.autome/output/

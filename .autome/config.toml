@@ -1,0 +1,11 @@
+[roles.intake]
+enabled = true
+runtime = "codex"
+model = "gpt-6.1-sol"
+effort = "medium"
+skills = []
+# 本项目的 Loop 配置覆盖。
+# 只写需要覆盖的字段；未出现的字段继承 ~/.autome/config.toml 的全局默认值。
+# 删除一个字段即恢复继承——不要为了"固定住"当前值而把全局值抄进来。
+#
+# 本文件随仓库提交，用于跨机器同步。任务内的 Agent 不得修改 .autome/ 下的内容。

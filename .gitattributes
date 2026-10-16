@@ -2,3 +2,4 @@
 *.rs text eol=lf
 crates/automed/tests/golden/prompts/*.md text eol=lf
 crates/automed/src/protocol/seed/** text eol=lf
+.autome/skill/*.sh text eol=lf
