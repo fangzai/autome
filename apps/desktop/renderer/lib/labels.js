@@ -51,6 +51,7 @@ export const FLOW = [
 ];
 
 export const ROLE_LABELS = {
+  intake: '任务整理',
   plan: '设计',
   review: '评审',
   adjudicate: '裁决',

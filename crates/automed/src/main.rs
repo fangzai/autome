@@ -26,6 +26,24 @@ fn write_outbound(writer: &mut impl io::Write, outbound: &Outbound) -> Result<()
 const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
 
 fn main() {
+    // A native bridge for Windows npm cmd/bat shims. MSYS/cmd quoting otherwise
+    // corrupts embedded TOML quotes and can consume every following argument.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("run-cli")) {
+        let mut args = std::env::args_os().skip(2);
+        let Some(program) = args.next() else {
+            eprintln!("run-cli: missing program");
+            std::process::exit(64);
+        };
+        let status = automed::platform::command(std::path::Path::new(&program))
+            .and_then(|mut command| command.args(args).status());
+        match status {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(error) => {
+                eprintln!("run-cli: {error}");
+                std::process::exit(70);
+            }
+        }
+    }
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("session-job-keeper") {
         let pid = std::env::args().nth(2).and_then(|s| s.parse::<u32>().ok());

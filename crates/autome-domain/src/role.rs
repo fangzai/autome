@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    Intake,
     Plan,
     Review,
     Adjudicate,
@@ -26,7 +27,8 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
+        Role::Intake,
         Role::Plan,
         Role::Review,
         Role::Adjudicate,
@@ -40,6 +42,7 @@ impl Role {
     /// change an on-disk config file's schema.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Role::Intake => "intake",
             Role::Plan => "plan",
             Role::Review => "review",
             Role::Adjudicate => "adjudicate",
@@ -57,6 +60,7 @@ impl Role {
     /// the terminal tab title.
     pub const fn round_name(self) -> &'static str {
         match self {
+            Role::Intake => "任务整理轮",
             Role::Plan => "设计轮",
             Role::Review => "评审轮",
             Role::Adjudicate => "裁决轮",
@@ -84,7 +88,7 @@ impl Role {
             // The retro round does own a file, but not one named after the
             // slug: it writes `docs/<slug>/lessons.md`, which the core reads
             // rather than the next round.
-            Role::Plan | Role::Impl | Role::Retro => None,
+            Role::Intake | Role::Plan | Role::Impl | Role::Retro => None,
         }
     }
 
@@ -209,11 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn round_names_are_distinct_and_cover_all_six_roles() {
+    fn round_names_are_distinct_and_cover_all_seven_roles() {
         let mut names: Vec<&str> = Role::ALL.iter().map(|r| r.round_name()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
     }
 
     /// The retro round writes `lessons.md`, which is not named after the slug
@@ -237,6 +241,7 @@ mod tests {
         assert_eq!(
             pairs,
             vec![
+                (Role::Intake, None),
                 (Role::Plan, None),
                 (Role::Review, Some(Role::Plan)),
                 (Role::Adjudicate, None),

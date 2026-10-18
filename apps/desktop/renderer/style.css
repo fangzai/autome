@@ -703,7 +703,7 @@ body { font-size: 13px; }
 .pick { display: flex; gap: 6px; flex-wrap: wrap; }
 .pick .tag { cursor: pointer; height: 26px; padding: 0 11px; } .pick .tag.on { background: var(--animal-primary); border-color: var(--animal-primary); color: #fff; }
 .envcard__login { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; margin-top: 8px; }
-.roleline { display: grid; grid-template-columns: 44px 1fr; gap: 4px 10px; font-size: 12.5px; font-weight: 600; color: var(--animal-text-body); }
+.roleline { display: grid; grid-template-columns: 56px 1fr; gap: 2px 10px; font-size: 12.5px; font-weight: 600; color: var(--animal-text-body); }
 .roleline b { color: var(--animal-text); font-weight: 800; }
 .roleline .m { color: var(--animal-text-secondary); }
 .skillcard { padding: 14px 18px 12px; display: flex; flex-direction: column; gap: 6px; min-height: 150px; }

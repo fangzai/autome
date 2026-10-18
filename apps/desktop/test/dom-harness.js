@@ -27,7 +27,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, ipcMain } = require('electron');
 const appProtocol = require('../src/app-protocol');
 const {
   FIXTURES,
@@ -741,7 +741,7 @@ async function run() {
   );
   check(
     'every role in the config gets a configurable node, and the fixed steps and human stops stay inert (C-04, U-08)',
-    sameModel.roleNodes === ROLE_COUNT && sameModel.fixedNodes === 4 && sameModel.humanNodes === 2,
+    sameModel.roleNodes === ROLE_COUNT && sameModel.fixedNodes === 3 && sameModel.humanNodes === 2,
     { ...sameModel, expectedRoleNodes: ROLE_COUNT }
   );
 
@@ -774,6 +774,143 @@ async function run() {
   check('agy model query failure preserves selectable model and suffix effort rules',
     modelFailure.model === 'gemini-4-high' && modelFailure.effortDisabled && modelFailure.error && modelFailure.refresh,
     modelFailure);
+
+  // Exercise the real intake drawer, preload mapping and write allowlist.
+  const intakeWrites = [];
+  ipcMain.handle('autome:read', () => ({ status: 'ready', models: [{ id: 'intake-test-model' }] }));
+  ipcMain.handle('autome:write', (_event, request) => {
+    const validated = require('../src/write-gate').validateWriteRequest(request);
+    if (!validated.ok) throw new Error(validated.message);
+    intakeWrites.push(request);
+    return {};
+  });
+  const intakeEditor = await evaluate(async () => {
+    const api = await import('autome://app/lib/api.js');
+    const routing = await import('autome://app/screens/routing.js');
+    const { close } = await import('autome://app/lib/overlay.js');
+    const host = document.getElementById('main');
+    const results = [];
+    for (const projectId of [null, 'prj_island']) {
+      const data = JSON.parse(document.getElementById('fx-routing').textContent);
+      data.projectId = projectId;
+      data.violations = [];
+      data.resolved.roles.find(r => r.role === 'audit').config.model = 'distinct-audit';
+      let refreshed = false;
+      api.setConnected(true);
+      routing.render(host, data, { params: {}, navigate() {}, refresh() { refreshed = true; } });
+      host.querySelector('[data-node="intake"]').click();
+      await new Promise(resolve => setTimeout(resolve, 30));
+      const drawer = document.getElementById('drawer');
+      const toggle = drawer.querySelector('[role="switch"]');
+      toggle.click();
+      const mandatory = toggle.getAttribute('aria-checked') === 'true' && toggle.getAttribute('aria-disabled') === 'true';
+      const selects = drawer.querySelectorAll('select');
+      const keepsDefault = selects[1].value === '';
+      selects[0].value = 'codex';
+      selects[0].dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(resolve => setTimeout(resolve, 30));
+      selects[1].value = 'intake-test-model';
+      selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+      selects[2].value = 'high';
+      selects[2].dispatchEvent(new Event('change', { bubbles: true }));
+      Array.from(drawer.querySelectorAll('button')).find(b => b.textContent === '应用到草稿').click();
+      Array.from(host.querySelectorAll('button')).find(b => b.textContent.startsWith('保存')).click();
+      for (let i = 0; i < 50 && !refreshed; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+      results.push({ mandatory, refreshed, keepsDefault });
+      close();
+    }
+    return results;
+  });
+  ipcMain.removeHandler('autome:read');
+  ipcMain.removeHandler('autome:write');
+  check('intake model drawer saves global and project routing through the real preload and gate',
+    intakeEditor.every(r => r.mandatory && r.refreshed && r.keepsDefault) &&
+    intakeWrites.length === 2 && intakeWrites.every(w => w.op === 'config.set_role' &&
+      w.params.role === 'intake' && w.params.runtime === 'codex' &&
+      w.params.model === 'intake-test-model' && w.params.effort === 'high' && w.params.enabled === true) &&
+    !intakeWrites[0].params.project_id && intakeWrites[1].params.project_id === 'prj_island',
+    { intakeEditor, intakeWrites });
+
+  // Project branch editing uses Git-provided candidates through the preload.
+  const branchWrites = [];
+  let branchMode = 'repo';
+  let branchReads = 0;
+  ipcMain.handle('autome:read', (_event, request) => {
+    const checked = require('../src/ipc-gate').validateReadRequest(request);
+    if (!checked.ok || request.method !== 'project.branches') throw new Error('unexpected branch read');
+    branchReads += 1;
+    if (branchMode === 'failure') throw new Error('Git repository unavailable');
+    return {
+      can_change: branchMode !== 'blocked', blocking_tasks: branchMode === 'blocked' ? ['T-running'] : [],
+      repos: branchMode === 'workspace' ? [
+        { member: 'docs', default_branch: 'main', current_branch: 'main', branches: ['main', 'release/docs'] },
+        { member: 'backend', default_branch: 'master', current_branch: 'master', branches: ['develop', 'master'] },
+      ] : [{ member: null, default_branch: 'main', current_branch: 'main', branches: ['main', 'feature/中文'] }],
+    };
+  });
+  ipcMain.handle('autome:write', (_event, request) => {
+    const checked = require('../src/write-gate').validateWriteRequest(request);
+    if (!checked.ok) throw new Error(checked.message);
+    if (request.op === 'project.set_default_branch') branchWrites.push(request);
+    return {};
+  });
+  const branchResults = [];
+  for (const mode of ['repo', 'workspace', 'blocked', 'failure']) {
+    branchMode = mode;
+    branchResults.push(await evaluate(async mode => {
+      const api = await import('autome://app/lib/api.js');
+      const project = await import('autome://app/screens/project.js');
+      const overlay = await import('autome://app/lib/overlay.js');
+      const data = JSON.parse(document.getElementById('fx-project').textContent);
+      if (mode === 'workspace') { data.project.kind = 'workspace'; data.project.docs_repo = 'docs'; }
+      api.setConnected(true);
+      api.resetWriteControls();
+      let refreshed = false;
+      const host = document.getElementById('main');
+      host.replaceChildren();
+      project.render(host, data, { params: {}, navigate() {}, refresh() { refreshed = true; } });
+      Array.from(host.querySelectorAll('button')).find(b => b.textContent === '修改默认分支').click();
+      const drawer = document.getElementById('drawer');
+      const waitLoaded = async () => {
+        for (let i = 0; i < 50 && drawer.textContent.includes('正在从 Git'); i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+      };
+      await waitLoaded();
+      const branch = drawer.querySelector('[aria-label="默认分支"]');
+      if (!branch) throw new Error(`branch drawer missing for ${mode}: ${drawer.textContent}`);
+      const save = Array.from(drawer.querySelectorAll('button')).find(b => b.textContent === '保存默认分支');
+      if (mode === 'blocked' || mode === 'failure') {
+        const result = { mode, disabled: branch.disabled && save.disabled,
+          reason: drawer.textContent.includes(mode === 'blocked' ? 'T-running' : '无法读取 Git 分支') };
+        overlay.close();
+        return result;
+      }
+      const startsAtMain = branch.value === 'main' && save.disabled;
+      Array.from(drawer.querySelectorAll('button')).find(b => b.textContent === '刷新分支').click();
+      await waitLoaded();
+      if (mode === 'workspace') {
+        const member = drawer.querySelector('[aria-label="成员仓库"]');
+        if (!member) throw new Error(`member selector missing: ${drawer.textContent}`);
+        member.value = 'backend';
+        member.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      branch.value = mode === 'workspace' ? 'develop' : 'feature/中文';
+      branch.dispatchEvent(new Event('change', { bubbles: true }));
+      const selectable = !save.disabled;
+      save.click();
+      for (let i = 0; i < 50 && !refreshed; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+      overlay.close();
+      return { mode, startsAtMain, selectable, refreshed };
+    }, mode));
+  }
+  ipcMain.removeHandler('autome:read');
+  ipcMain.removeHandler('autome:write');
+  check('default branch drawer refreshes Git candidates, saves single/member selections and explains blocked/error states',
+    branchResults.slice(0, 2).every(r => r.startsAtMain && r.selectable && r.refreshed) &&
+    branchResults.slice(2).every(r => r.disabled && r.reason) && branchReads === 6 &&
+    branchWrites.length === 2 && branchWrites.every(w => w.op === 'project.set_default_branch') &&
+    branchWrites[0].params.branch === 'feature/中文' && !branchWrites[0].params.member &&
+    branchWrites[1].params.branch === 'develop' && branchWrites[1].params.member === 'backend',
+    { branchResults, branchReads, branchWrites });
 
   // ---- the usage card, and what the two gates have to disclose ----------
   //

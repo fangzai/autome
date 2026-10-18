@@ -1,10 +1,8 @@
 // 路由图 — requirements C-04 … C-07, U-08.
 //
 // The Loop as a picture: two lanes of boxes with edges drawn between them.
-// Six boxes are roles and open a configuration drawer; the rest are grey
-// fixed system steps or yellow human stops and are deliberately inert,
-// because the requirement says they are not configurable and a box that looks
-// clickable but is not is worse than one that looks fixed.
+// Seven boxes are roles and open a configuration drawer. Grey boxes are
+// fixed operations that do not run a model; yellow boxes are human stops.
 //
 // C-06 is enforced here twice over, on purpose. The core refuses a colliding
 // save, and this screen refuses to offer one: the draft is validated with the
@@ -52,7 +50,6 @@ const EDGES = [
 ];
 
 const FIXED_NODES = {
-  intake: ['任务整理', '固定 · 调研仓库，生成任务文件', 'Claude Code'],
   rebase: ['rebase', '固定 · 到最新默认分支', '冲突 → 实现修'],
   merge: ['合并', '固定 · merge 到默认分支', '主工作树须干净'],
   cleanup: ['清理', '固定 · 删 worktree 与分支', 'docs 留在默认分支'],
@@ -62,6 +59,7 @@ const HUMAN_NODES = {
   merge_wait: ['待合并', '人工 · 你点合并', '文件列表 · 统计'],
 };
 const ROLE_NODES = {
+  intake: ['任务整理', 'intake · 调研仓库，生成任务文件'],
   plan: ['设计', 'plan · 写设计文档与里程碑'],
   review: ['评审', 'review · 独立模型挑问题'],
   adjudicate: ['裁决', 'adjudicate · 逐条采纳或驳回'],
@@ -147,7 +145,7 @@ function buildScreen(data, ctx, draft, paint, projectId) {
     h('div.pagehead.pagehead--tight', [
       h('h1.ribbon.ribbon--purple', [h('span.ribbon__front', { text: '路由图' })]),
       h('span.pagehead__sub', {
-        text: '五个角色可点开配置 · 灰色为固定系统步骤 · 黄色为人工停顿 · 实线通过 · 虚线驳回',
+        text: '七个角色可点开配置 · 灰色为固定系统步骤 · 黄色为人工停顿 · 实线通过 · 虚线驳回',
       }),
       h('div.pagehead__actions', [
         scopeToggle(ctx, projectId, data),
@@ -209,7 +207,7 @@ function graph(data, draft, localViolations, paint, ctx) {
 
   const laneOne = h('div.lane.lane--7', { dataset: { lane: '1' } }, [
     h('span.lane__lbl', { text: `设计循环 · 最多 ${((data.resolved || {}).loop_defaults || {}).design_rounds ?? '—'} 轮` }),
-    fixedNode('intake'),
+    roleNode('intake', draft, badRoles, data, paint, ctx),
     roleNode('plan', draft, badRoles, data, paint, ctx),
     roleNode('review', draft, badRoles, data, paint, ctx),
     roleNode('adjudicate', draft, badRoles, data, paint, ctx),
@@ -338,7 +336,7 @@ function legend() {
   }
   row.appendChild(h('span', [h('span.ln'), text('通过')]));
   row.appendChild(h('span', [h('span.ln.rej'), text('驳回 / 返工')]));
-  const note = h('span.muted.ml-auto', { text: '每个角色可单独关闭 · 关闭评审时裁决一并跳过' });
+  const note = h('span.muted.ml-auto', { text: '任务整理为必经步骤 · 其他角色可关闭 · 关闭评审时裁决一并跳过' });
   row.appendChild(note);
   return row;
 }
@@ -469,6 +467,7 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
   });
   if (config.enabled) toggle.classList.add('checked');
   const flip = () => {
+    if (role === 'intake') return;
     config.enabled = !config.enabled;
     toggle.classList.toggle('checked', config.enabled);
     toggle.setAttribute('aria-checked', config.enabled ? 'true' : 'false');
@@ -481,9 +480,13 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
       flip();
     }
   });
+  if (role === 'intake') {
+    toggle.setAttribute('aria-disabled', 'true');
+    toggle.setAttribute('tabindex', '-1');
+  }
   form.appendChild(h('label', { text: '启用' }));
   form.appendChild(
-    h('span.row', [toggle, h('span.small.muted', { text: '关闭后该节点跳过' })])
+    h('span.row', [toggle, h('span.small.muted', { text: role === 'intake' ? '必经步骤，模型可配置' : '关闭后该节点跳过' })])
   );
 
   // CLI
@@ -540,7 +543,10 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
         modelSelect.replaceChildren();
         const models = state.models || [];
         if (models.length > 0) {
-          let foundSelected = false;
+          const defaultOption = h('option', { value: '', text: 'CLI 默认模型' });
+          defaultOption.selected = !config.model;
+          modelSelect.appendChild(defaultOption);
+          let foundSelected = !config.model;
           for (const model of models) {
             const label = model.name && model.name !== model.id ? `${model.name} (${model.id})` : model.id;
             const option = h('option', { value: model.id, text: label });
@@ -555,9 +561,6 @@ function openRoleDrawer(role, draft, data, paint, ctx) {
               const currentOpt = h('option', { value: config.model, text: `${config.model} (当前值)` });
               currentOpt.selected = true;
               modelSelect.prepend(currentOpt);
-            } else {
-              config.model = models[0].id;
-              modelSelect.value = config.model;
             }
           }
           modelStatus.textContent = `${models.length} 个候选模型`;

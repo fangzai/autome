@@ -13,6 +13,8 @@
 //!   Electron Main by two independent allowlists; a method that appears on the
 //!   read side must be side-effect free, or that separation means nothing.
 
+use std::path::PathBuf;
+
 use autome_domain::config::{self, ConfigViolation, ProjectConfig, RoleOverrides};
 use autome_domain::environment::{self, Component};
 use autome_domain::project::{self, AddDisposition, Onboarding, Project, ProjectKind};
@@ -331,6 +333,8 @@ fn dispatch(ctx: &mut Ctx, command: &Command) -> DispatchResult {
         // ---- projects ----------------------------------------------------
         "project.list" => project_list(ctx),
         "project.get" => project_get(ctx, str_param(p, "project_id")?),
+        "project.branches" => project_branches(ctx, str_param(p, "project_id")?),
+        "project.set_default_branch" => project_set_default_branch(ctx, p),
         "project.probe" => project_probe(ctx, str_param(p, "path")?),
         "project.add" => project_add(
             ctx,
@@ -505,6 +509,117 @@ fn project_get(ctx: &mut Ctx, project_id: &str) -> DispatchResult {
             "rules": rule_files(&project.path),
         }),
         vec![],
+    ))
+}
+
+fn project_branch_blockers(ctx: &Ctx, project_id: &str) -> Result<Vec<String>, DispatchError> {
+    Ok(ctx
+        .store
+        .list_tasks(project_id)?
+        .into_iter()
+        .filter(|task| !task.state.is_terminal())
+        .map(|task| task.id)
+        .collect())
+}
+
+fn project_branches(ctx: &mut Ctx, project_id: &str) -> DispatchResult {
+    let project = ctx.store.get_project(project_id)?;
+    let targets: Vec<(Option<&str>, PathBuf, &str)> = if project.is_workspace() {
+        project
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    Some(member.name.as_str()),
+                    PathBuf::from(project.member_path(&member.name)),
+                    member.default_branch.as_str(),
+                )
+            })
+            .collect()
+    } else {
+        vec![(
+            None,
+            PathBuf::from(&project.path),
+            project.default_branch.as_str(),
+        )]
+    };
+    let mut repos = Vec::new();
+    for (member, path, default_branch) in targets {
+        let branches = git::local_branches(&path)?;
+        let current = git::run(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        repos.push(json!({
+            "member": member,
+            "default_branch": default_branch,
+            "current_branch": if current.ok() { Some(current.line()) } else { None },
+            "branches": branches,
+        }));
+    }
+    let blockers = project_branch_blockers(ctx, project_id)?;
+    Ok((
+        json!({ "repos": repos, "can_change": blockers.is_empty(), "blocking_tasks": blockers }),
+        vec![],
+    ))
+}
+
+fn project_set_default_branch(ctx: &mut Ctx, params: &Value) -> DispatchResult {
+    let project_id = str_param(params, "project_id")?;
+    let branch = str_param(params, "branch")?;
+    let member = opt_str_param(params, "member");
+    let mut project = ctx.store.get_project(project_id)?;
+    let (path, previous) = if project.is_workspace() {
+        let name = member.ok_or_else(|| bad_params("请选择成员仓库"))?;
+        let entry = project
+            .members
+            .iter()
+            .find(|m| m.name == name)
+            .ok_or_else(|| bad_params("未知成员仓库"))?;
+        (
+            PathBuf::from(project.member_path(name)),
+            entry.default_branch.clone(),
+        )
+    } else {
+        if member.is_some() {
+            return Err(bad_params("单仓库项目不接受成员仓库"));
+        }
+        (PathBuf::from(&project.path), project.default_branch.clone())
+    };
+    if !git::local_branches(&path)?
+        .iter()
+        .any(|name| name == branch)
+    {
+        return Err(rejected("所选分支不在 Git 本地分支列表中，请刷新后重试"));
+    }
+    if previous == branch {
+        return Ok((json!({ "project": project }), vec![]));
+    }
+    let blockers = project_branch_blockers(ctx, project_id)?;
+    if !blockers.is_empty() {
+        return Err(rejected(format!(
+            "请先完成或取消未结束任务，再修改默认分支：{}",
+            blockers.join("、")
+        )));
+    }
+    if let Some(name) = member {
+        project
+            .members
+            .iter_mut()
+            .find(|m| m.name == name)
+            .unwrap()
+            .default_branch = branch.into();
+        if project.docs_repo.as_deref() == Some(name) {
+            project.default_branch = branch.into();
+        }
+    } else {
+        project.default_branch = branch.into();
+    }
+    ctx.store.replace_project(&project)?;
+    let payload = json!({ "member": member, "previous": previous, "default_branch": branch });
+    let seq = ctx
+        .store
+        .append_event("project.updated", project_id, payload.clone())?;
+    Ok((
+        json!({ "project": project }),
+        vec![event(seq, "project.updated", project_id, payload)],
     ))
 }
 
@@ -1028,6 +1143,9 @@ fn config_set_role(ctx: &mut Ctx, params: &Value) -> DispatchResult {
     let global = config_io::load_global(&ctx.autome_home)?;
 
     let enabled = params.get("enabled").and_then(Value::as_bool);
+    if role == Role::Intake && enabled == Some(false) {
+        return Err(bad_params("任务整理是必经步骤，不能关闭"));
+    }
     let runtime = match params.get("runtime").and_then(Value::as_str) {
         Some(r) => {
             Some(Runtime::parse(r).ok_or_else(|| bad_params(format!("未知 runtime `{r}`")))?)
@@ -1276,6 +1394,7 @@ fn describe_violation(v: &ConfigViolation) -> String {
 
 fn role_label(role: Role) -> &'static str {
     match role {
+        Role::Intake => "任务整理",
         Role::Plan => "设计",
         Role::Review => "评审",
         Role::Adjudicate => "裁决",
@@ -2337,10 +2456,11 @@ fn runtime_models(ctx: &Ctx, raw_runtime: &str, refresh: bool) -> DispatchResult
 /// Method names the read channel may carry: everything that cannot mutate.
 /// Electron Main enforces the split, but the list lives here so it stays next
 /// to the dispatch table it describes.
-pub const READ_METHODS: [&str; 20] = [
+pub const READ_METHODS: [&str; 21] = [
     "project.list",
     "project.probe",
     "project.get",
+    "project.branches",
     "project.onboarding.artefacts",
     "task.get",
     "task.changes",
@@ -2464,6 +2584,178 @@ mod tests {
     }
 
     // ---- protocol --------------------------------------------------------
+
+    #[test]
+    fn default_branch_selection_uses_git_and_controls_the_next_task_base() {
+        needs_git!();
+        let mut sb = Sandbox::new("branch-select");
+        let id = sb.add_project("p");
+        let repo = sb.path("p");
+        std::fs::write(repo.join("README.md"), "initial\n").unwrap();
+        git::commit_paths(&repo, &["README.md"], "initial").unwrap();
+        let tip = git::run_ok(
+            &repo,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "feature base",
+            ],
+        )
+        .unwrap();
+        git::run_ok(&repo, &["branch", "feature/中文", tip.line()]).unwrap();
+        let before_head = git::run_ok(&repo, &["symbolic-ref", "HEAD"])
+            .unwrap()
+            .stdout;
+        let out = handle_command(
+            sb.ctx(),
+            &cmd("project.branches", json!({ "project_id": id })),
+        );
+        let inventory = ok_payload(&out);
+        assert_eq!(
+            inventory["repos"][0]["branches"],
+            json!(["feature/中文", "main"])
+        );
+        assert_eq!(inventory["can_change"], true);
+        assert!(out.events.is_empty());
+
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "project.set_default_branch",
+                json!({
+                    "project_id": id, "branch": "feature/中文"
+                }),
+            ),
+        );
+        assert_eq!(
+            ok_payload(&out)["project"]["default_branch"],
+            "feature/中文"
+        );
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(
+            git::run_ok(&repo, &["symbolic-ref", "HEAD"])
+                .unwrap()
+                .stdout,
+            before_head
+        );
+        let out = handle_command(sb.ctx(), &cmd("project.get", json!({ "project_id": id })));
+        assert_eq!(
+            ok_payload(&out)["project"]["default_branch"],
+            "feature/中文"
+        );
+
+        git::run_ok(&repo, &["branch", "stale"]).unwrap();
+        git::run_ok(&repo, &["branch", "-D", "stale"]).unwrap();
+        for branch in ["stale", "HEAD", "--help", "feature/中文~1"] {
+            let out = handle_command(
+                sb.ctx(),
+                &cmd(
+                    "project.set_default_branch",
+                    json!({
+                        "project_id": id, "branch": branch
+                    }),
+                ),
+            );
+            assert!(err_message(&out).contains("Git 本地分支"));
+        }
+
+        let created = handle_command(
+            sb.ctx(),
+            &cmd(
+                "task.create",
+                json!({
+                    "project_id": id, "request": "branch selection regression"
+                }),
+            ),
+        );
+        let task_id = ok_payload(&created)["task"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        handle_command(sb.ctx(), &cmd("scheduler.tick", json!({})));
+        let task = sb.ctx.store.get_task(&task_id).unwrap();
+        // Freezing the protocol creates a commit on top of the selected base.
+        assert!(git::is_ancestor(&repo, tip.line(), &task.branch()).unwrap());
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "project.set_default_branch",
+                json!({
+                    "project_id": id, "branch": "main"
+                }),
+            ),
+        );
+        assert!(err_message(&out).contains("未结束任务"));
+        assert_eq!(
+            sb.ctx.store.get_project(&id).unwrap().default_branch,
+            "feature/中文"
+        );
+        let out = handle_command(
+            sb.ctx(),
+            &cmd("project.branches", json!({ "project_id": id })),
+        );
+        assert_eq!(ok_payload(&out)["can_change"], false);
+    }
+
+    #[test]
+    fn workspace_default_branch_selection_updates_the_correct_member_and_docs_alias() {
+        needs_git!();
+        let mut sb = Sandbox::new("ws-branches");
+        let target = sb.path("ws");
+        workspace_at(&target, &[("docs", "main"), ("backend", "master")]);
+        git::run_ok(&target.join("docs"), &["branch", "release/docs"]).unwrap();
+        git::run_ok(&target.join("backend"), &["branch", "develop"]).unwrap();
+        let added = handle_command(
+            sb.ctx(),
+            &cmd(
+                "project.add",
+                json!({
+                    "path": target, "workspace": true, "docs_repo": "docs"
+                }),
+            ),
+        );
+        let id = ok_payload(&added)["project"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let listed = handle_command(
+            sb.ctx(),
+            &cmd("project.branches", json!({ "project_id": id })),
+        );
+        assert_eq!(ok_payload(&listed)["repos"].as_array().unwrap().len(), 2);
+        for (member, branch) in [("backend", "develop"), ("docs", "release/docs")] {
+            let out = handle_command(
+                sb.ctx(),
+                &cmd(
+                    "project.set_default_branch",
+                    json!({
+                        "project_id": id, "member": member, "branch": branch
+                    }),
+                ),
+            );
+            ok_payload(&out);
+        }
+        let project = sb.ctx.store.get_project(&id).unwrap();
+        assert_eq!(project.default_branch, "release/docs");
+        let layout = crate::layout::TaskLayout::workspace(&project, "sample", &["backend".into()]);
+        assert_eq!(layout.repos[0].base, "release/docs");
+        assert_eq!(layout.repos[1].base, "develop");
+        for member in ["../docs", "missing"] {
+            let out = handle_command(
+                sb.ctx(),
+                &cmd(
+                    "project.set_default_branch",
+                    json!({
+                        "project_id": id, "member": member, "branch": "main"
+                    }),
+                ),
+            );
+            assert!(err_message(&out).contains("未知成员"));
+        }
+    }
 
     #[test]
     fn a_version_mismatch_is_a_protocol_violation() {
@@ -3296,6 +3588,68 @@ mod tests {
     }
 
     // ---- config ----------------------------------------------------------
+
+    #[test]
+    fn intake_configuration_round_trips_through_global_project_and_reset_commands() {
+        needs_git!();
+        let mut sb = Sandbox::new("cfg-intake");
+        let id = sb.add_project("p");
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "config.set_role",
+                json!({
+                    "role": "intake", "runtime": "codex", "model": "intake-global", "effort": "high"
+                }),
+            ),
+        );
+        ok_payload(&out);
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "config.set_role",
+                json!({
+                    "project_id": id, "role": "intake", "runtime": "agy", "model": "intake-project", "effort": "low"
+                }),
+            ),
+        );
+        ok_payload(&out);
+        let project = config_io::load_project(&sb.path("p")).unwrap();
+        let global = config_io::load_global(&sb.ctx.autome_home).unwrap();
+        let resolved = config::resolve(&global, &project);
+        assert_eq!(resolved.role(Role::Intake).config.model, "intake-project");
+        assert_eq!(resolved.role(Role::Intake).config.runtime, Runtime::Agy);
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "config.reset_role",
+                json!({
+                    "project_id": id, "role": "intake"
+                }),
+            ),
+        );
+        ok_payload(&out);
+        let reset = config_io::load_project(&sb.path("p")).unwrap();
+        assert!(!reset.roles.contains_key(&Role::Intake));
+        assert_eq!(
+            config::resolve(&global, &reset)
+                .role(Role::Intake)
+                .config
+                .model,
+            "intake-global"
+        );
+        let out = handle_command(
+            sb.ctx(),
+            &cmd(
+                "config.set_role",
+                json!({
+                    "role": "intake", "enabled": false
+                }),
+            ),
+        );
+        assert!(err_message(&out).contains("不能关闭"));
+        assert_eq!(config_io::load_global(&sb.ctx.autome_home).unwrap(), global);
+    }
 
     #[test]
     fn config_get_without_a_project_returns_the_global_defaults() {

@@ -147,6 +147,16 @@ const RESOLVED_CONFIG = {
   loop_provenance: { parallel: 'global', design_rounds: 'global', budget_factor: 'global' },
   roles: [
     {
+      role: 'intake',
+      config: { enabled: true, runtime: 'claude', model: '', effort: null, skills: [] },
+      provenance: 'global',
+    },
+    {
+      role: 'retro',
+      config: { enabled: true, runtime: 'codex', model: 'gpt-6-sol', effort: 'high', skills: [] },
+      provenance: 'global',
+    },
+    {
       role: 'plan',
       config: { enabled: true, runtime: 'claude', model: 'claude-opus-5', effort: 'high', skills: ['island-shop-conventions'] },
       provenance: 'global',

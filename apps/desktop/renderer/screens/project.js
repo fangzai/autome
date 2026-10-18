@@ -84,7 +84,7 @@ export function render(host, data, ctx) {
   );
 
   const cards = h('div.cardgrid.cardgrid--3', [
-    reveal(repoCard(project, data), 1),
+    reveal(repoCard(project, data, ctx), 1),
     reveal(configCard(data, ctx), 2),
     reveal(rulesCard(data, ctx), 3),
   ]);
@@ -355,7 +355,7 @@ function isFinished(task) {
 // The three information cards
 // ---------------------------------------------------------------------------
 
-function repoCard(project, data) {
+function repoCard(project, data, ctx) {
   const onboarding = project.onboarding || {};
   const onboardingText =
     onboarding.onboarding === 'in_progress'
@@ -380,7 +380,103 @@ function repoCard(project, data) {
       'inherit'
     ),
   ]);
+  card.appendChild(registerWrite(h('button.btn.btn--sm', {
+    type: 'button',
+    onClick: () => openDefaultBranchDrawer(project, ctx),
+  }, [text('修改默认分支')])));
   return card;
+}
+
+function openDefaultBranchDrawer(project, ctx) {
+  const form = h('div.form');
+  const status = h('div.quiet', { role: 'status', text: '正在从 Git 获取本地分支…' });
+  const memberSelect = h('select.select', { 'aria-label': '成员仓库' });
+  const branchSelect = h('select.select', { 'aria-label': '默认分支' });
+  const current = h('div.quiet');
+  let inventory = null;
+  let loading = false;
+  const selectedRepo = () => inventory && inventory.repos.find(r => (r.member || '') === memberSelect.value);
+  const save = registerWrite(h('button.btn.btn--primary', {
+    type: 'button',
+    onClick: async () => {
+      const repo = selectedRepo();
+      if (!repo || loading) return;
+      loading = true;
+      save.disabled = true;
+      const result = await attempt({
+        label: '默认分支已更新',
+        success: '新任务将使用所选分支作为基线与合并目标。',
+        run: write => write.setDefaultBranch(project.id, branchSelect.value, repo.member || undefined),
+        onDone: () => { close(); return ctx.refresh(); },
+      });
+      if (!result.ok) await loadBranches();
+    },
+  }, [text('保存默认分支')]));
+  const updateSave = () => {
+    const repo = selectedRepo();
+    save.disabled = loading || !inventory || !inventory.can_change || !repo ||
+      !branchSelect.value || branchSelect.value === repo.default_branch;
+  };
+  const showBranches = () => {
+    branchSelect.replaceChildren();
+    const repo = selectedRepo();
+    if (repo) {
+      if (!repo.branches.includes(repo.default_branch)) {
+        branchSelect.appendChild(h('option', { value: '', text: `${repo.default_branch}（本地分支不存在）`, disabled: true, selected: true }));
+      }
+      for (const name of repo.branches) {
+        branchSelect.appendChild(h('option', { value: name, text: name, selected: name === repo.default_branch }));
+      }
+      current.textContent = `当前检出：${repo.current_branch || '分离 HEAD'}`;
+    }
+    branchSelect.disabled = loading || !repo || !inventory.can_change || !repo.branches.length;
+    updateSave();
+  };
+  async function loadBranches() {
+    loading = true;
+    branchSelect.disabled = true;
+    save.disabled = true;
+    refresh.disabled = true;
+    status.textContent = '正在从 Git 获取本地分支…';
+    try {
+      const next = await read('projectBranches', project.id);
+      if (!form.isConnected) return;
+      const previousMember = memberSelect.value;
+      inventory = next;
+      memberSelect.replaceChildren();
+      for (const repo of inventory.repos) {
+        memberSelect.appendChild(h('option', {
+          value: repo.member || '', text: repo.member || project.display_name || '当前仓库',
+          selected: (repo.member || '') === (previousMember || project.docs_repo || ''),
+        }));
+      }
+      status.textContent = inventory.can_change
+        ? '候选项来自 Git 本地分支，可刷新列表。'
+        : `请先完成或取消未结束任务：${(inventory.blocking_tasks || []).join('、')}`;
+    } catch (err) {
+      inventory = null;
+      status.textContent = `无法读取 Git 分支：${err.message}`;
+    } finally {
+      loading = false;
+      refresh.disabled = false;
+      if (form.isConnected) showBranches();
+    }
+  }
+  const refresh = h('button.btn.btn--sm', { type: 'button', onClick: loadBranches }, [text('刷新分支')]);
+  memberSelect.addEventListener('change', showBranches);
+  branchSelect.addEventListener('change', updateSave);
+  if (project.kind === 'workspace') {
+    form.appendChild(h('label', { text: '成员仓库' }));
+    form.appendChild(memberSelect);
+  }
+  form.appendChild(h('label', { text: '默认分支' }));
+  form.appendChild(branchSelect);
+  form.appendChild(current);
+  form.appendChild(status);
+  form.appendChild(refresh);
+  form.appendChild(h('div.quiet', { text: '设置任务基线与合并目标，不切换当前检出分支。合并前，主工作树需切到所选分支。' }));
+  openDrawer({ title: '修改默认分支', body: [form], footer: [closeButton('取消'), save] });
+  loadBranches();
 }
 
 function configCard(data, ctx) {

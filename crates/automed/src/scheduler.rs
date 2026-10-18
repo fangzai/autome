@@ -1158,9 +1158,10 @@ fn start_session(
     let (protocol_ref, protocol) = freeze_protocol(ctx, task, resolved, &worktree)?;
     let rules_hash = rules_hash(&repo);
 
-    let role_config = match kind.role() {
-        Some(role) => resolved.role(role).config.clone(),
-        None => launcher::system_role_config(),
+    let role_config = match kind {
+        SessionKind::Intake => resolved.role(Role::Intake).config.clone(),
+        SessionKind::Role { role } => resolved.role(role).config.clone(),
+        SessionKind::Onboarding => launcher::system_role_config(),
     };
 
     let decisions = ctx.store.decisions_for_prompt(&task.id)?;
@@ -2290,6 +2291,66 @@ mod tests {
     }
 
     // ---- the transition path ---------------------------------------------
+
+    #[test]
+    fn intake_launch_uses_saved_global_and_project_model_configuration() {
+        needs_git!();
+        let mut w = World::new("intake-routing");
+        let mut global = config::GlobalConfig::default();
+        let intake = global.roles.get_mut(&Role::Intake).unwrap();
+        intake.runtime = autome_domain::role::Runtime::Codex;
+        intake.model = "configured-global-model".into();
+        intake.effort = Some("high".into());
+        config_io::save_global(&w.ctx.autome_home, &global).unwrap();
+
+        for (id, slug, project_override) in [
+            ("T-1", "global", false),
+            ("T-2", "project", true),
+            ("T-3", "reset", false),
+        ] {
+            let mut project = config::ProjectConfig::default();
+            if project_override {
+                project.roles.insert(
+                    Role::Intake,
+                    config::RoleOverrides {
+                        runtime: Some(autome_domain::role::Runtime::Agy),
+                        model: Some("configured-project-model".into()),
+                        effort: Some(Some("low".into())),
+                        ..Default::default()
+                    },
+                );
+            }
+            config_io::save_project(&w.repo, &project).unwrap();
+            w.add_task(id, slug);
+            advance(&mut w.ctx, id, &Trigger::SlotAvailable).unwrap();
+            let sessions = w.ctx.store.list_sessions(id).unwrap();
+            let session = sessions
+                .iter()
+                .find(|s| s.kind == SessionKind::Intake)
+                .unwrap();
+            assert_eq!(
+                session.runtime,
+                if project_override {
+                    autome_domain::role::Runtime::Agy
+                } else {
+                    autome_domain::role::Runtime::Codex
+                }
+            );
+            assert_eq!(
+                session.model,
+                if project_override {
+                    "configured-project-model"
+                } else {
+                    "configured-global-model"
+                }
+            );
+            assert_eq!(
+                session.effort.as_deref(),
+                Some(if project_override { "low" } else { "high" })
+            );
+            assert_eq!(w.state(id), TaskState::Active { node: Node::Intake });
+        }
+    }
 
     #[test]
     fn a_finished_intake_moves_the_task_to_design() {

@@ -13,9 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::role::{Role, Runtime};
 
-/// Which kind of work a session does. `Intake` and `Onboarding` are fixed
-/// system prompts, not one of the five configurable roles, so they cannot be
-/// represented by `Role` alone.
+/// Which kind of work a session does. Intake has configurable model routing
+/// but keeps its own prompt and lifecycle; onboarding is a system session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionKind {
@@ -38,6 +37,7 @@ impl SessionKind {
             SessionKind::Intake => "任务整理".into(),
             SessionKind::Onboarding => "Onboarding".into(),
             SessionKind::Role { role } => match role {
+                Role::Intake => "任务整理".into(),
                 Role::Plan => "设计".into(),
                 Role::Review => "评审".into(),
                 Role::Adjudicate => "裁决".into(),

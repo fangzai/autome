@@ -404,7 +404,10 @@ fn probe_agy_login(binary_path: &Path) -> Login {
                     Login::Expired
                 } else {
                     Login::Unknown {
-                        detail: format!("agy 连通测试失败（退出码 {:?}）：{err_msg}", capture.exit_code),
+                        detail: format!(
+                            "agy 连通测试失败（退出码 {:?}）：{err_msg}",
+                            capture.exit_code
+                        ),
                     }
                 }
             }

@@ -216,6 +216,7 @@ impl Default for GlobalConfig {
             skills: Vec::new(),
         };
         let mut roles = BTreeMap::new();
+        roles.insert(Role::Intake, role(Runtime::Claude, None));
         roles.insert(Role::Plan, role(Runtime::Claude, Some("high")));
         roles.insert(Role::Review, role(Runtime::Codex, Some("high")));
         roles.insert(Role::Adjudicate, role(Runtime::Claude, None));
@@ -345,7 +346,8 @@ pub fn resolve(global: &GlobalConfig, project: &ProjectConfig) -> ResolvedConfig
             ResolvedRole {
                 role,
                 config: RoleConfig {
-                    enabled: over.enabled.unwrap_or(base.enabled),
+                    // Intake creates the task document and cannot be skipped.
+                    enabled: role == Role::Intake || over.enabled.unwrap_or(base.enabled),
                     runtime: over.runtime.unwrap_or(base.runtime),
                     model: over.model.unwrap_or_else(|| base.model.clone()),
                     effort: over.effort.unwrap_or_else(|| base.effort.clone()),
@@ -581,6 +583,39 @@ mod tests {
         let resolved = resolved_default();
         let order: Vec<Role> = resolved.roles.iter().map(|r| r.role).collect();
         assert_eq!(order, Role::ALL.to_vec());
+    }
+
+    #[test]
+    fn intake_inherits_overrides_and_resets_while_remaining_mandatory() {
+        let mut global = GlobalConfig::default();
+        assert_eq!(global.role(Role::Intake).runtime, Runtime::Claude);
+        assert!(global.role(Role::Intake).model.is_empty());
+        global.roles.get_mut(&Role::Intake).unwrap().model = "opus".into();
+        let mut project = ProjectConfig::default();
+        project.roles.insert(
+            Role::Intake,
+            RoleOverrides {
+                enabled: Some(false),
+                runtime: Some(Runtime::Agy),
+                model: Some("gemini-4-high".into()),
+                effort: Some(Some("high".into())),
+                ..Default::default()
+            },
+        );
+        let resolved = resolve(&global, &project);
+        let intake = resolved.role(Role::Intake);
+        assert!(intake.config.enabled);
+        assert_eq!(intake.config.runtime, Runtime::Agy);
+        assert_eq!(intake.config.model, "gemini-4-high");
+        assert_eq!(intake.config.effort.as_deref(), Some("high"));
+        assert_eq!(intake.provenance, Provenance::Project);
+        project.roles.remove(&Role::Intake);
+        let reset = resolve(&global, &project);
+        assert_eq!(reset.role(Role::Intake).config.model, "opus");
+        assert_eq!(reset.role(Role::Intake).provenance, Provenance::Global);
+        global.roles.remove(&Role::Intake);
+        global.repair();
+        assert_eq!(global.role(Role::Intake).runtime, Runtime::Claude);
     }
 
     #[test]

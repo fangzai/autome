@@ -127,6 +127,28 @@ specified, what survives, and why the rest was dropped.
 
 ## Building
 
+### Run the desktop app on Windows
+
+```powershell
+# From the repository root; build the Rust core before starting Electron.
+cargo build -p automed
+cd apps/desktop
+npm ci
+npm start
+```
+
+In Settings → Routing, click **任务整理** to choose its CLI, model and effort.
+The global default is Claude Code with the CLI's default model. A project's
+routing page can override it; **恢复默认** restores inheritance from the global
+configuration. Changes apply when the next intake session starts. Intake
+creates the task document and cannot be disabled.
+
+On the project page, **修改默认分支** loads the local branches from Git.
+Choose a branch and save it as the base and merge target for new tasks;
+workspace members can be configured individually. Finish or cancel unfinished
+tasks before changing this setting. The setting does not check out a branch:
+before merging, the main worktree must be on the chosen branch.
+
 ```sh
 cargo test                      # the domain, the core, and the end-to-end suite
 cargo clippy --all-targets      # warnings are errors in CI

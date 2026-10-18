@@ -436,6 +436,25 @@ pub fn default_branch(repo: &Path) -> Option<String> {
     None
 }
 
+/// Actual local branch names, including slash and non-ASCII names. Using the
+/// full ref avoids `refname:short` ambiguity with tags of the same name.
+pub fn local_branches(repo: &Path) -> Result<Vec<String>> {
+    let out = run_ok(
+        repo,
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)",
+            "refs/heads/",
+        ],
+    )?;
+    Ok(out
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("refs/heads/").map(str::to_string))
+        .collect())
+}
+
 pub fn branch_exists(repo: &Path, branch: &str) -> bool {
     run(
         repo,
@@ -1200,6 +1219,25 @@ mod tests {
         needs_git!();
         let repo = repo_with_commit("head-branch");
         assert_eq!(default_branch(repo.path()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn local_branch_inventory_preserves_names_and_excludes_tags_and_remotes() {
+        needs_git!();
+        let repo = repo_with_commit("branch-list");
+        run_ok(repo.path(), &["branch", "feature/中文"]).unwrap();
+        run_ok(repo.path(), &["tag", "feature/中文"]).unwrap();
+        run_ok(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/remote-only", "HEAD"],
+        )
+        .unwrap();
+        assert_eq!(
+            local_branches(repo.path()).unwrap(),
+            vec!["feature/中文", "main"]
+        );
+        run_ok(repo.path(), &["branch", "-D", "feature/中文"]).unwrap();
+        assert_eq!(local_branches(repo.path()).unwrap(), vec!["main"]);
     }
 
     #[test]

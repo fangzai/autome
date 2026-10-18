@@ -168,7 +168,7 @@ fn parse_global(text: &str) -> std::result::Result<GlobalConfig, String> {
                 // it silently would leave the user staring at a setting that
                 // does nothing.
                 return Err(format!(
-                    "未知角色 `{name}`，可选：plan/review/adjudicate/impl/audit"
+                    "未知角色 `{name}`，可选：intake/plan/review/adjudicate/impl/audit/retro"
                 ));
             };
             let Some(table) = table.as_table() else {
@@ -270,7 +270,7 @@ fn parse_project(text: &str) -> std::result::Result<ProjectConfig, String> {
         for (name, table) in roles {
             let Some(role) = Role::parse(name) else {
                 return Err(format!(
-                    "未知角色 `{name}`，可选：plan/review/adjudicate/impl/audit"
+                    "未知角色 `{name}`，可选：intake/plan/review/adjudicate/impl/audit/retro"
                 ));
             };
             let Some(table) = table.as_table() else {
@@ -902,6 +902,10 @@ effort = ""
         let dir = TempDir::new("global-round");
         let mut config = GlobalConfig::default();
         config.loop_defaults.parallel = 5;
+        let intake = config.roles.get_mut(&Role::Intake).unwrap();
+        intake.runtime = Runtime::Codex;
+        intake.model = "gpt-6-sol".into();
+        intake.effort = Some("high".into());
         config.roles.get_mut(&Role::Plan).unwrap().effort = None;
         config.roles.get_mut(&Role::Audit).unwrap().skills = vec!["vitest".into()];
         save_global(dir.path(), &config).unwrap();
@@ -920,6 +924,7 @@ effort = ""
         assert_eq!(config.roles.len(), Role::ALL.len());
         assert_eq!(config.role(Role::Plan).model, "m");
         assert_eq!(config.role(Role::Audit).runtime, Runtime::Codex);
+        assert_eq!(config.role(Role::Intake).runtime, Runtime::Claude);
     }
 
     #[test]

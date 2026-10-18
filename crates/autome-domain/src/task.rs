@@ -327,7 +327,7 @@ pub struct Context<'a> {
 pub enum Action {
     /// Nothing to do; the new state is just a record.
     None,
-    /// Launch the intake session (fixed system prompt, Claude Code).
+    /// Launch the intake session (fixed prompt, configurable model and runtime).
     StartIntake,
     /// Launch a role session. `inject` carries anything the transition wants
     /// appended to the prompt: rejection feedback, conflict files, or the

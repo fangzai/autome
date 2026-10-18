@@ -198,14 +198,12 @@ fn query_codex(_binary: &Path) -> Result<Vec<Model>, String> {
 
     if let Some(home) = codex_home {
         let cache_file = home.join("models_cache.json");
-        if cache_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&cache_file) {
-                if let Ok(models) = parse_codex_models(&content) {
-                    if !models.is_empty() {
-                        return Ok(models);
-                    }
-                }
-            }
+        if cache_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&cache_file)
+            && let Ok(models) = parse_codex_models(&content)
+            && !models.is_empty()
+        {
+            return Ok(models);
         }
     }
 
@@ -231,7 +229,10 @@ fn parse_codex_models(text: &str) -> Result<Vec<Model>, String> {
         if let Some(id) = item.slug.or(item.id) {
             let id = id.trim().to_string();
             if !id.is_empty() && seen.insert(id.clone()) {
-                let name = item.display_name.or(item.name).unwrap_or_else(|| id.clone());
+                let name = item
+                    .display_name
+                    .or(item.name)
+                    .unwrap_or_else(|| id.clone());
                 list.push(Model { id, name });
             }
         }
@@ -244,22 +245,55 @@ fn parse_codex_models(text: &str) -> Result<Vec<Model>, String> {
 
 fn default_codex_models() -> Vec<Model> {
     vec![
-        Model { id: "gpt-6.1-sol".into(), name: "GPT-6.1-Sol".into() },
-        Model { id: "gpt-6-astra".into(), name: "GPT-6-Astra".into() },
-        Model { id: "gpt-6-sol".into(), name: "GPT-6-Sol".into() },
-        Model { id: "gpt-6-luna".into(), name: "GPT-6-Luna".into() },
-        Model { id: "gpt-5.6-sol".into(), name: "GPT-5.6-Sol".into() },
-        Model { id: "gpt-5.6-terra".into(), name: "GPT-5.6-Terra".into() },
-        Model { id: "o3-mini".into(), name: "o3-mini".into() },
-        Model { id: "o1".into(), name: "o1".into() },
+        Model {
+            id: "gpt-6.1-sol".into(),
+            name: "GPT-6.1-Sol".into(),
+        },
+        Model {
+            id: "gpt-6-astra".into(),
+            name: "GPT-6-Astra".into(),
+        },
+        Model {
+            id: "gpt-6-sol".into(),
+            name: "GPT-6-Sol".into(),
+        },
+        Model {
+            id: "gpt-6-luna".into(),
+            name: "GPT-6-Luna".into(),
+        },
+        Model {
+            id: "gpt-5.6-sol".into(),
+            name: "GPT-5.6-Sol".into(),
+        },
+        Model {
+            id: "gpt-5.6-terra".into(),
+            name: "GPT-5.6-Terra".into(),
+        },
+        Model {
+            id: "o3-mini".into(),
+            name: "o3-mini".into(),
+        },
+        Model {
+            id: "o1".into(),
+            name: "o1".into(),
+        },
     ]
 }
 
 fn default_claude_models() -> Vec<Model> {
     vec![
-        Model { id: "claude-opus-5".into(), name: "Claude Opus 5".into() },
-        Model { id: "claude-sonnet-5.5".into(), name: "Claude Sonnet 5.5".into() },
-        Model { id: "claude-haiku-4.5".into(), name: "Claude Haiku 4.5".into() },
+        Model {
+            id: "claude-opus-5".into(),
+            name: "Claude Opus 5".into(),
+        },
+        Model {
+            id: "claude-sonnet-5.5".into(),
+            name: "Claude Sonnet 5.5".into(),
+        },
+        Model {
+            id: "claude-haiku-4.5".into(),
+            name: "Claude Haiku 4.5".into(),
+        },
     ]
 }
 

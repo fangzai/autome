@@ -22,6 +22,7 @@
 const ALLOWED_WRITE_OPS = Object.freeze([
   'project.pick',
   'project.confirm',
+  'project.set_default_branch',
   'project.onboarding.advance',
   'project.onboarding.skip',
   'project.onboarding.run',
@@ -66,7 +67,7 @@ const ALLOWED_WRITE_OPS = Object.freeze([
 // that was here before had five entries and the core had six. `retro` was
 // added to the loop and never to this line, so saving the 复盘 role was
 // refused by Main with "unknown role" before the core ever saw it.
-const ROLES = Object.freeze(['plan', 'review', 'adjudicate', 'impl', 'audit', 'retro']);
+const ROLES = Object.freeze(['intake', 'plan', 'review', 'adjudicate', 'impl', 'audit', 'retro']);
 
 // Ops whose params may contain prose the user typed, and the cap on it. A
 // one-line request and a rejection reason are the only two.
@@ -191,6 +192,13 @@ function validateShape(op, params) {
 // Per-op checks for the values that leave the sandbox: an opened path, a
 // terminal command, an install target.
 function validateOpSpecific(op, params) {
+  if (op === 'project.set_default_branch') {
+    if (typeof params.project_id !== 'string' || !params.project_id ||
+        typeof params.branch !== 'string' || !params.branch ||
+        (params.member !== undefined && (typeof params.member !== 'string' || !params.member || looksLikeAPath(params.member)))) {
+      return { ok: false, message: 'default branch needs a project id, branch and optional member name' };
+    }
+  }
   if (op === 'open.path') {
     // The renderer names *which* thing to open by id, never by path — Main
     // resolves the path from the core's own answer.

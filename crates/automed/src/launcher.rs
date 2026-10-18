@@ -358,7 +358,7 @@ pub fn build_prompt(spec: &PromptSpec<'_>) -> Result<String> {
     let mut p = String::new();
 
     match spec.kind {
-        SessionKind::Intake => return intake_prompt(spec),
+        SessionKind::Intake => p.push_str(&intake_prompt(spec)?),
         SessionKind::Onboarding => return onboarding_prompt(spec),
         SessionKind::Role { role } => {
             p.push_str(&role_prompt(role, spec)?);
@@ -423,6 +423,9 @@ pub fn build_prompt(spec: &PromptSpec<'_>) -> Result<String> {
 /// leave a literal `{…}` in front of the model, so every placeholder is
 /// replaced and any leftover is an error.
 fn role_prompt(role: Role, spec: &PromptSpec<'_>) -> Result<String> {
+    if role == Role::Intake {
+        return intake_prompt(spec);
+    }
     let template = spec.templates.prompt(role.as_str()).ok_or_else(|| {
         err(format!(
             "协议版本里没有 prompts/{}.md，无法启动{}",
@@ -717,16 +720,31 @@ pub fn launch(spec: &LaunchSpec<'_>) -> Result<Launched> {
     let binary = adapter(spec.runtime).binary;
     let resolved_binary = resolve_binary(spec.runtime)
         .ok_or_else(|| err(format!("PATH 中找不到 {binary}，请先在本地环境页安装")))?;
+    let renderer = renderer_path();
 
     let mut argv = vec![
         crate::platform::shell_path(&wrapper),
         spec.session_id.to_string(),
         crate::platform::shell_path(&session_dir),
         spec.runtime.as_str().to_string(),
-        crate::platform::shell_path(Path::new(&renderer_path())),
+        crate::platform::shell_path(Path::new(&renderer)),
         crate::platform::shell_path(Path::new(&resolved_binary)),
         crate::platform::shell_path(&prompt_path),
     ];
+    #[cfg(windows)]
+    if Path::new(&resolved_binary)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        // MSYS invokes batch files through cmd.exe with incompatible quoting.
+        // Route them through our native process API, preserving the exact argv.
+        if !Path::new(&renderer).is_file() {
+            return Err(err("Windows 批处理 CLI 需要可用的 automed 内核路径"));
+        }
+        argv[5] = crate::platform::shell_path(Path::new(&renderer));
+        argv.push("run-cli".into());
+        argv.push(resolved_binary);
+    }
     argv.extend(spec.args.iter().cloned());
 
     let pid = run_in_terminal(&argv, spec.cwd)?;
@@ -768,8 +786,15 @@ fn run_in_terminal(argv: &[String], cwd: &Path) -> Result<i32> {
     let mut cmd = {
         let bash = git_bash_path().map_err(|e| err(e.to_string()))?;
         let mut c = Command::new(bash);
-        c.arg(crate::platform::shell_path(Path::new(&argv[0])));
-        c.args(&argv[1..]);
+        // MSYS parses native Windows argv differently when invoked as a script
+        // interpreter. A single shell command keeps embedded TOML quotes and
+        // following arguments intact even when the value has no whitespace.
+        let line = argv
+            .iter()
+            .map(|arg| sh_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        c.arg("-c").arg(format!("exec {line}"));
         c
     };
 
@@ -1020,7 +1045,7 @@ pub fn hold_session_job(pid: u32, created: u64) -> std::io::Result<()> {
     win_proc::hold_job(pid, created)
 }
 
-/// The fixed profile the two system sessions run under.
+/// The fallback profile for onboarding. Intake uses its configured role.
 pub fn system_role_config() -> RoleConfig {
     let runtime = [Runtime::Claude, Runtime::Agy, Runtime::Codex]
         .into_iter()
@@ -1380,11 +1405,27 @@ mod tests {
     // ---- prompts ---------------------------------------------------------
 
     #[test]
+    fn intake_keeps_its_prompt_and_includes_configured_skills() {
+        let templates = templates();
+        let skills = vec!["repo-facts".into()];
+        let intake = build_prompt(&spec(SessionKind::Intake, &skills, None, &templates)).unwrap();
+        assert!(intake.contains("本轮必须使用以下技能：repo-facts"));
+        let role = build_prompt(&spec(
+            SessionKind::Role { role: Role::Intake },
+            &skills,
+            None,
+            &templates,
+        ))
+        .unwrap();
+        assert_eq!(intake, role);
+    }
+
+    #[test]
     fn a_role_prompt_names_the_round_it_is() {
         // The bug this replaced: every round was handed the same sentence
         // pointing at a task-file section that did not exist, so four real
         // sessions ran and produced nothing.
-        for role in Role::ALL {
+        for role in Role::ALL.into_iter().filter(|r| *r != Role::Intake) {
             let p =
                 build_prompt(&spec(SessionKind::Role { role }, &[], None, &templates())).unwrap();
             assert!(
@@ -1407,7 +1448,9 @@ mod tests {
             assert!(p.contains("checkout-flow-task.md"), "{role}: {p}");
             // Every round is pointed at its brief, which is the index into
             // everything else.
-            assert!(p.contains("brief/"), "{role}: {p}");
+            if role != Role::Intake {
+                assert!(p.contains("brief/"), "{role}: {p}");
+            }
             // Every round of the loop itself names the design document. The
             // retro round deliberately does not: it reads the evidence and the
             // numbers the core hands it, and adding the design document back
@@ -1438,7 +1481,7 @@ mod tests {
         // 最终的合并", which is false: the core sweeps up what a session
         // leaves behind. A sentence that is not true about the system will be
         // acted on as if it were.
-        for role in Role::ALL {
+        for role in Role::ALL.into_iter().filter(|r| *r != Role::Intake) {
             let prompt =
                 build_prompt(&spec(SessionKind::Role { role }, &[], None, &templates())).unwrap();
             assert!(
@@ -1454,7 +1497,7 @@ mod tests {
 
     #[test]
     fn every_role_prompt_says_what_protocol_failure_is_for() {
-        for role in Role::ALL {
+        for role in Role::ALL.into_iter().filter(|r| *r != Role::Intake) {
             let prompt =
                 build_prompt(&spec(SessionKind::Role { role }, &[], None, &templates())).unwrap();
             assert!(
@@ -1470,7 +1513,7 @@ mod tests {
         // the branch was identical to its base and the merge would have
         // brought nothing. The core sweeps up afterwards, but a round that
         // commits its own work produces a legible history.
-        for role in Role::ALL {
+        for role in Role::ALL.into_iter().filter(|r| *r != Role::Intake) {
             let p =
                 build_prompt(&spec(SessionKind::Role { role }, &[], None, &templates())).unwrap();
             assert!(p.contains("git commit"), "{role}: {p}");
@@ -1620,7 +1663,7 @@ mod tests {
     fn every_role_prompt_forbids_starting_the_next_session() {
         // The core schedules; a round that relays would bypass the parallel
         // limit, pause, the role toggles and the budgets.
-        for role in Role::ALL {
+        for role in Role::ALL.into_iter().filter(|r| *r != Role::Intake) {
             let p =
                 build_prompt(&spec(SessionKind::Role { role }, &[], None, &templates())).unwrap();
             assert!(p.contains("不要启动下一个会话"), "{role}: {p}");
@@ -1935,6 +1978,84 @@ mod tests {
             vec!["first arg", "it's second", "$(echo pwned)"],
             "command line was: {line}"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn git_bash_preserves_codex_config_quotes_and_following_flags() {
+        let mut args = adapter(Runtime::Codex)
+            .extra_writable_roots(&[PathBuf::from("D:/Agent Code/中文/.git")]);
+        args.extend(vec![
+            "--model".to_string(),
+            "gpt-6.1-sol".to_string(),
+            "--config".to_string(),
+            "model_reasoning_effort=medium".to_string(),
+        ]);
+        let out = Command::new(git_bash_path().unwrap())
+            .args(["-c", "printf '%s\\n' \"$@\"", "--"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), args);
+        let node = which("node").expect("Node.js");
+        let script = format!(
+            "{} -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- \"$@\"",
+            sh_quote(&node)
+        );
+        let out = Command::new(git_bash_path().unwrap())
+            .args(["-c", &script, "--"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let native_args: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(native_args, args);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_command_preserves_codex_config_through_windows_shims() {
+        let Some(node) = which("node") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("autome-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::init::init(&dir, crate::protocol::seed()).unwrap();
+        let capture = dir.join("capture.cjs");
+        std::fs::write(
+            &capture,
+            "console.log(JSON.stringify(process.argv.slice(2)));\n",
+        )
+        .unwrap();
+        let shim = dir.join("fake.cmd");
+        std::fs::write(
+            &shim,
+            format!("@\"{}\" \"{}\" %*\r\n", node, capture.display()),
+        )
+        .unwrap();
+        let mut args = adapter(Runtime::Codex)
+            .extra_writable_roots(&[PathBuf::from("D:/AgentCode/autome/.git")]);
+        args.extend([
+            "--model".into(),
+            "gpt-6.1-sol".into(),
+            "--config".into(),
+            "model_reasoning_effort=medium".into(),
+        ]);
+        let native = crate::platform::command(&shim)
+            .unwrap()
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        let captured: Vec<String> = serde_json::from_slice(&native.stdout).unwrap();
+        assert_eq!(captured, args);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

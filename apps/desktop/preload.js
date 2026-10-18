@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('autome', {
     dashboard: () => read('dashboard.get')(),
     listProjects: () => read('project.list')(),
     getProject: (projectId) => read('project.get')({ project_id: projectId }),
+    projectBranches: (projectId) => read('project.branches')({ project_id: projectId }),
     getTask: (taskId) => read('task.get')({ task_id: taskId }),
     taskChanges: (taskId) => read('task.changes')({ task_id: taskId }),
     sessionLog: (sessionId) => read('session.log')({ session_id: sessionId }),
@@ -48,6 +49,11 @@ contextBridge.exposeInMainWorld('autome', {
   },
 
   write: {
+    setDefaultBranch: (projectId, branch, member) => {
+      const params = { project_id: projectId, branch };
+      if (member) params.member = member;
+      return write('project.set_default_branch')(params);
+    },
     // Main owns the directory picker; the renderer never names a path.
     pickProject: () => write('project.pick')(),
     // Answers the question `pickProject` asks about a directory that holds
