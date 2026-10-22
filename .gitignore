@@ -20,3 +20,4 @@ windows_port_plan*.md
 # Autome
 .worktree/
 .autome/output/
+./artifacts/
